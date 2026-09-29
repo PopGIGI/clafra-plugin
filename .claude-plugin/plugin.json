@@ -1,0 +1,7 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "clafra",
+  "version": "0.1.0",
+  "description": "Skill lifecycle governance: creation threshold + overlap guard, drift detection, edit-time constraints, deprecation with audit trail, artifact-grounded maintenance review.",
+  "author": { "name": "PoP" }
+}

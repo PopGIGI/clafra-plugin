@@ -1,0 +1,20 @@
+{
+  "intent": "Compute order fees with Decimal money and banker's rounding via apply_fee",
+  "watches": [
+    "src/fees.py"
+  ],
+  "checks": [
+    "grep -q 'ROUND_HALF_EVEN' src/fees.py",
+    "cd src && python3 -c 'from decimal import Decimal as D; from fees import apply_fee; assert apply_fee(D(\"10.00\")) == D(\"10.25\")'"
+  ],
+  "stack_dependencies": [
+    "requirements.txt"
+  ],
+  "evidence": [
+    "session:demo-a",
+    "session:demo-b",
+    "session:demo-c"
+  ],
+  "created_at": "2026-09-01T00:00:00Z",
+  "staleness_days": 30
+}

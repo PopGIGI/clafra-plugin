@@ -1,0 +1,36 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "fixes", "deprecation_candidates"],
+  "properties": {
+    "summary": { "type": "string" },
+    "fixes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["skill", "field", "old", "new", "evidence"],
+        "properties": {
+          "skill": { "type": "string" },
+          "field": { "enum": ["watches", "checks"] },
+          "old": { "type": "string" },
+          "new": { "type": "string" },
+          "evidence": { "type": "string", "description": "one whole entry copied exactly from a skill failures list, deleted, or a rename fact" }
+        }
+      }
+    },
+    "deprecation_candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["skill", "rationale", "evidence"],
+        "properties": {
+          "skill": { "type": "string" },
+          "rationale": { "type": "string" },
+          "evidence": { "type": "string", "description": "one whole entry copied exactly from a skill failures list, deleted, or a rename fact" }
+        }
+      }
+    }
+  }
+}

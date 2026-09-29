@@ -1,0 +1,17 @@
+{
+  "intent": "Export orders as headerless CSV for the legacy accounting import",
+  "watches": [
+    "src/legacy_export.py"
+  ],
+  "checks": [
+    "grep -q 'def export_orders_csv' src/legacy_export.py"
+  ],
+  "stack_dependencies": [],
+  "evidence": [
+    "session:demo-d",
+    "session:demo-e",
+    "session:demo-f"
+  ],
+  "created_at": "2026-09-01T00:00:00Z",
+  "staleness_days": 30
+}

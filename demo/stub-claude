@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Stand-in for `claude -p` in offline demo runs: returns one properly cited and one
+# uncited finding, so the anti-circularity filter can be tested without a model.
+cat <<'JSON'
+{"type":"result","is_error":false,"total_cost_usd":0,"structured_output":{
+ "summary":"stub",
+ "fixes":[{"skill":"fee-calc","field":"watches","old":"src/fees.py","new":"src/billing.py","evidence":"renamed src/fees.py -> src/billing.py"}],
+ "deprecation_candidates":[{"skill":"fee-calc","rationale":"I feel it is obsolete","evidence":"fee logic looks outdated"}]}}
+JSON

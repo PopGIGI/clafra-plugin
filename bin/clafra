@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+"""clafra — skill lifecycle governance for Claude Code projects.
+
+Governed skills are native Claude Code skills (.claude/skills/<name>/SKILL.md)
+with a sidecar clafra.json holding governance metadata:
+
+    intent               canonical description, used for overlap checks
+    watches              paths/globs the skill depends on (drift + edit-time context)
+    checks               shell commands run from the repo root; exit 0 = holds
+    stack_dependencies   files whose change forces revalidation
+    evidence             >=3 session refs justifying creation
+    status               active | stale
+    last_validated / validated_commit / staleness_days
+
+Subcommands: validate, status, create, overlap, deprecate, gather, review, ack,
+hook session-start, hook pre-edit. Stdlib only.
+"""
+import argparse
+import datetime as dt
+import fnmatch
+import glob
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OVERLAP_BLOCK = 0.7
+OVERLAP_AMBIGUOUS = 0.4
+EVIDENCE_MIN = 3
+CHECK_TIMEOUT = 10
+STOPWORDS = set("a an and are as at be by for from in into is it of on or that the this to with via all".split())
+
+
+# ---------------------------------------------------------------- helpers
+
+def now():
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def repo_root():
+    for cand in (os.environ.get("CLAFRA_ROOT"), os.environ.get("CLAUDE_PROJECT_DIR")):
+        if cand and os.path.isdir(cand):
+            return os.path.abspath(cand)
+    try:
+        out = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, timeout=5)
+        if out.returncode == 0:
+            return out.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return os.getcwd()
+
+
+def git(root, *args):
+    try:
+        out = subprocess.run(["git", "-C", root, *args], capture_output=True, text=True, timeout=10)
+        return out.stdout.strip() if out.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+GITIGNORE = "# runtime state; audit.log and deprecated/ are the audit trail and stay tracked\nstate.json\nreview-state.json\nvalidation.log\nsummon.log\nreviews/\n"
+
+
+def state_dir(root):
+    d = os.path.join(root, ".clafra")
+    os.makedirs(d, exist_ok=True)
+    gi = os.path.join(d, ".gitignore")
+    if not os.path.exists(gi):
+        with open(gi, "w") as f:
+            f.write(GITIGNORE)
+    return d
+
+
+def load_state(root):
+    return load_json(os.path.join(root, ".clafra", "state.json"), {}) or {}
+
+
+def save_state(root, state):
+    write_json(os.path.join(state_dir(root), "state.json"), state)
+
+
+def append(root, name, line):
+    with open(os.path.join(state_dir(root), name), "a") as f:
+        f.write(line.rstrip("\n") + "\n")
+
+
+def load_json(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def skills(root):
+    """Yield (name, skill_dir, meta) for every governed skill.
+
+    meta = declarative clafra.json (tracked) overlaid with runtime state from
+    .clafra/state.json (untracked), so validation never dirties the repo.
+    """
+    state = load_state(root).get("skills", {})
+    for meta_path in sorted(glob.glob(os.path.join(root, ".claude", "skills", "*", "clafra.json"))):
+        meta = load_json(meta_path)
+        if isinstance(meta, dict):
+            d = os.path.dirname(meta_path)
+            name = os.path.basename(d)
+            yield name, d, {**meta, **state.get(name, {})}
+
+
+def tokens(text):
+    return {t for t in re.findall(r"[a-z]+", text.lower()) if t not in STOPWORDS and len(t) > 1}
+
+
+def cosine(a, b):
+    ta, tb = tokens(a), tokens(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / math.sqrt(len(ta) * len(tb))
+
+
+def is_glob(p):
+    return any(c in p for c in "*?[")
+
+
+# ---------------------------------------------------------------- validation
+
+def evaluate(root, name, meta):
+    """Return list of failure reasons (empty = holds). Pure: no writes."""
+    reasons = []
+    for w in meta.get("watches", []):
+        if is_glob(w):
+            if not glob.glob(os.path.join(root, w), recursive=True):
+                reasons.append(f"watch matches nothing: {w}")
+        elif not os.path.exists(os.path.join(root, w)):
+            reasons.append(f"watched path missing: {w}")
+    for c in meta.get("checks", []):
+        try:
+            r = subprocess.run(c, shell=True, cwd=root, capture_output=True, timeout=CHECK_TIMEOUT,
+                               env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+            if r.returncode != 0:
+                reasons.append(f"check failed: {c}")
+        except subprocess.TimeoutExpired:
+            reasons.append(f"check timed out: {c}")
+    base = meta.get("validated_commit")
+    deps = meta.get("stack_dependencies", [])
+    if base and deps:
+        changed = git(root, "diff", "--name-only", base, "HEAD")
+        if changed is not None:
+            hit = [f for f in changed.splitlines() if any(fnmatch.fnmatch(f, d) for d in deps)]
+            if hit:
+                reasons.append("stack dependency changed since last validation: " + ", ".join(hit))
+    if not meta.get("checks"):
+        reasons.append("no checks declared (cannot be validated)")
+    return reasons
+
+
+def validate(root, write=True):
+    head = git(root, "rev-parse", "--short", "HEAD") or "nogit"
+    state = load_state(root)
+    runtime = state.setdefault("skills", {})
+    results = []
+    for name, d, meta in skills(root):
+        reasons = evaluate(root, name, meta)
+        status = "stale" if reasons else "active"
+        age_note = None
+        if not reasons and meta.get("last_validated"):
+            last = dt.datetime.strptime(meta["last_validated"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+            age = (dt.datetime.now(dt.timezone.utc) - last).days
+            if age > meta.get("staleness_days", 30):
+                age_note = f"not validated for {age} days"
+        results.append({"skill": name, "status": status, "reasons": reasons, "note": age_note})
+        if write:
+            rt = runtime.setdefault(name, {})
+            prev = rt.get("status")
+            rt["status"] = status
+            rt["stale_reasons"] = reasons
+            if status == "active":
+                rt["last_validated"] = now()
+                rt["validated_commit"] = git(root, "rev-parse", "HEAD") or rt.get("validated_commit")
+                rt.pop("stale_since", None)
+            elif prev != "stale":
+                rt["stale_since"] = now()
+            append(root, "validation.log",
+                   f"{now()} | {head} | {name} | {'PASS' if not reasons else 'FAIL'} | {'; '.join(reasons) or 'ok'}")
+    if write:
+        state["skills"] = {k: v for k, v in runtime.items() if os.path.isdir(os.path.join(root, ".claude", "skills", k))}
+        save_state(root, state)
+    return results
+
+
+def unreviewed(root):
+    return sorted(p for p in glob.glob(os.path.join(root, ".clafra", "reviews", "*.json"))
+                  if not (load_json(p, {}) or {}).get("reviewed"))
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_validate(a):
+    root = repo_root()
+    res = validate(root, write=not a.no_write)
+    if a.json:
+        print(json.dumps(res, indent=2))
+    else:
+        if not res:
+            print("clafra: no governed skills in", root)
+        for r in res:
+            mark = "✓" if r["status"] == "active" else "✗"
+            print(f"{mark} {r['skill']}: {r['status']}")
+            for why in r["reasons"]:
+                print(f"    - {why}")
+            if r["note"]:
+                print(f"    ! {r['note']}")
+    return 1 if any(r["status"] == "stale" for r in res) else 0
+
+
+def cmd_status(a):
+    root = repo_root()
+    rc = cmd_validate(argparse.Namespace(json=False, no_write=True))
+    for p in unreviewed(root):
+        print(f"! unreviewed maintenance review: {os.path.relpath(p, root)}")
+    dep = sorted(glob.glob(os.path.join(root, ".clafra", "deprecated", "*")))
+    if dep:
+        print(f"  {len(dep)} deprecated skill(s) in .clafra/deprecated/")
+    return rc
+
+
+def overlap_scores(root, intent, exclude=None):
+    out = []
+    for name, _, meta in skills(root):
+        if name == exclude:
+            continue
+        out.append((round(cosine(intent, meta.get("intent", "")), 3), name))
+    return sorted(out, reverse=True)
+
+
+def cmd_overlap(a):
+    root = repo_root()
+    scores = overlap_scores(root, a.intent)
+    print(json.dumps([{"skill": n, "score": s} for s, n in scores], indent=2))
+    top = scores[0][0] if scores else 0
+    return 2 if top >= OVERLAP_BLOCK else 3 if top >= OVERLAP_AMBIGUOUS else 0
+
+
+def cmd_create(a):
+    root = repo_root()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,63}", a.name):
+        print("clafra: name must be kebab-case", file=sys.stderr)
+        return 1
+    d = os.path.join(root, ".claude", "skills", a.name)
+    if os.path.exists(d):
+        print(f"clafra: skill '{a.name}' already exists — update it instead", file=sys.stderr)
+        return 1
+
+    scores = overlap_scores(root, a.intent)
+    if scores and scores[0][0] >= OVERLAP_BLOCK:
+        s, n = scores[0]
+        print(f"BLOCKED: intent overlaps existing skill '{n}' (score {s} >= {OVERLAP_BLOCK}). "
+              f"Extend '{n}' instead of creating a new skill.", file=sys.stderr)
+        append(root, "audit.log", f"{now()} | create-blocked | {a.name} | overlap {n}={s}")
+        return 2
+    if scores and scores[0][0] >= OVERLAP_AMBIGUOUS and not a.confirm_distinct:
+        s, n = scores[0]
+        print(f"AMBIGUOUS: intent resembles '{n}' (score {s}). Re-run with "
+              f"--confirm-distinct '<why it differs>' after a human decision.", file=sys.stderr)
+        return 3
+
+    if len(a.evidence) < EVIDENCE_MIN and not a.override_threshold:
+        print(f"BLOCKED: {len(a.evidence)} evidence ref(s); the creation threshold is {EVIDENCE_MIN} "
+              f"sessions. Keep observing, or pass --override-threshold '<reason>'.", file=sys.stderr)
+        append(root, "audit.log", f"{now()} | create-blocked | {a.name} | evidence {len(a.evidence)}<{EVIDENCE_MIN}")
+        return 4
+    if not a.check:
+        print("BLOCKED: at least one --check is required; an unverifiable skill is born stale.", file=sys.stderr)
+        return 5
+
+    meta = {
+        "intent": a.intent,
+        "watches": a.watch,
+        "checks": a.check,
+        "stack_dependencies": a.stack_dep,
+        "evidence": a.evidence,
+        "created_at": now(),
+        "staleness_days": a.staleness_days,
+    }
+    if a.confirm_distinct:
+        meta["distinct_from"] = {"skill": scores[0][1], "score": scores[0][0], "reason": a.confirm_distinct}
+    if a.override_threshold:
+        meta["threshold_override"] = a.override_threshold
+    reasons = evaluate(root, a.name, meta)
+    if reasons:
+        print("BLOCKED: success criteria do not hold at creation:\n  - " + "\n  - ".join(reasons), file=sys.stderr)
+        return 5
+
+    os.makedirs(d)
+    body = a.body or f"# {a.name}\n\n{a.intent}\n"
+    with open(os.path.join(d, "SKILL.md"), "w") as f:
+        f.write(f"---\nname: {a.name}\ndescription: {json.dumps(a.description or a.intent)}\n---\n\n{body}\n")
+    write_json(os.path.join(d, "clafra.json"), meta)
+    state = load_state(root)
+    state.setdefault("skills", {})[a.name] = {"status": "active", "last_validated": now(),
+                                               "validated_commit": git(root, "rev-parse", "HEAD"), "stale_reasons": []}
+    save_state(root, state)
+    append(root, "audit.log", f"{now()} | created | {a.name} | evidence={len(a.evidence)}"
+           + (f" override={a.override_threshold!r}" if a.override_threshold else ""))
+    print(f"created .claude/skills/{a.name}/ (SKILL.md + clafra.json)")
+    return 0
+
+
+def cmd_deprecate(a):
+    root = repo_root()
+    d = os.path.join(root, ".claude", "skills", a.name)
+    meta = next((m for n, _, m in skills(root) if n == a.name), None)
+    if meta is None:
+        print(f"clafra: no governed skill '{a.name}'", file=sys.stderr)
+        return 1
+    if meta.get("status") != "stale" and not a.force:
+        print(f"REFUSED: '{a.name}' is {meta.get('status')}; only stale skills are deprecated. "
+              f"Use --force with a human decision.", file=sys.stderr)
+        return 2
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    dest = os.path.join(state_dir(root), "deprecated", f"{a.name}-{stamp}")
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    shutil.move(d, dest)
+    write_json(os.path.join(dest, "deprecation.json"), {
+        "skill": a.name, "deprecated_at": now(), "reason": a.reason, "forced": bool(a.force),
+        "status_at_deprecation": meta.get("status"), "stale_reasons": meta.get("stale_reasons", []),
+        "commit": git(root, "rev-parse", "HEAD"),
+    })
+    state = load_state(root)
+    state.get("skills", {}).pop(a.name, None)
+    save_state(root, state)
+    append(root, "audit.log", f"{now()} | deprecated | {a.name} | {a.reason}")
+    print(f"deprecated {a.name} -> {os.path.relpath(dest, root)}")
+    return 0
+
+
+def gather(root):
+    """Mechanical facts only — no LLM. Everything review cites must come from here."""
+    state = load_json(os.path.join(root, ".clafra", "review-state.json"), {}) or {}
+    head = git(root, "rev-parse", "HEAD")
+    base = state.get("last_commit")
+    renames, deleted = [], []
+    if base and head and base != head:
+        for line in (git(root, "diff", "-M", "--name-status", base, head) or "").splitlines():
+            parts = line.split("\t")
+            if parts[0].startswith("R") and len(parts) == 3:
+                renames.append({"old_path": parts[1], "new_path": parts[2],
+                                "fact": f"renamed {parts[1]} -> {parts[2]}"})
+            elif parts[0] == "D":
+                deleted.append(f"deleted {parts[1]}")
+    facts = {"repo": os.path.basename(root), "head": head, "since": base,
+             "renames": renames, "deleted": deleted, "skills": []}
+    for name, _, meta in skills(root):
+        facts["skills"].append({
+            "skill": name, "intent": meta.get("intent"), "watches": meta.get("watches", []),
+            "checks": meta.get("checks", []), "failures": evaluate(root, name, meta),
+            "stale_since": meta.get("stale_since"),
+        })
+    return facts
+
+
+def fact_atoms(facts):
+    """The only strings a review finding may cite as evidence."""
+    atoms = {r["fact"] for r in facts["renames"]} | set(facts["deleted"])
+    for sk in facts["skills"]:
+        atoms |= set(sk["failures"])
+    return atoms
+
+
+def cmd_gather(a):
+    print(json.dumps(gather(repo_root()), indent=2))
+    return 0
+
+
+def cmd_review(a):
+    root = repo_root()
+    facts = gather(root)
+    schema = load_json(os.path.join(PLUGIN_ROOT, "schemas", "review.schema.json"))
+    prompt = (
+        "You are the clafra maintenance reviewer. Below is a FACTS artifact produced mechanically "
+        "(no LLM). Rules: every finding's `evidence` field must be copied EXACTLY from one entry of a "
+        "skill's `failures`, the `deleted` list, or a rename's `fact` — whole entry, not a fragment. "
+        "Findings citing anything else are discarded. Do not speculate or investigate; "
+        "you have no tools. Propose a fix only when the artifact gives an unambiguous mapping (e.g. a "
+        "failure names a missing path and `renames` maps it to a new path). Deprecation candidates are "
+        "skills whose failures cannot be fixed from the artifact.\n\n<facts>\n"
+        + json.dumps(facts, indent=2) + "\n</facts>"
+    )
+    cmd = [os.environ.get("CLAFRA_CLAUDE", "claude"), "-p", prompt, "--output-format", "json",
+           "--json-schema", json.dumps(schema), "--tools", "", "--max-budget-usd", "0.50"]
+    if a.model:
+        cmd += ["--model", a.model]
+    r = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=300)
+    out = load_json_str(r.stdout)
+    if not out or out.get("is_error") or "structured_output" not in out:
+        print("clafra review: LLM call failed; facts saved as pending", file=sys.stderr)
+        print(r.stderr[-500:] or r.stdout[-500:], file=sys.stderr)
+        result = {"pending": True, "facts": facts}
+        rc = 1
+    else:
+        result = out["structured_output"]
+        # Anti-circularity: drop any finding whose evidence is not an exact fact atom.
+        atoms = fact_atoms(facts)
+        for key in ("fixes", "deprecation_candidates"):
+            kept, dropped = [], []
+            for f in result.get(key, []):
+                (kept if f.get("evidence") in atoms else dropped).append(f)
+            result[key] = kept
+            if dropped:
+                result.setdefault("uncited_dropped", []).extend(dropped)
+        result["cost_usd"] = out.get("total_cost_usd")
+        rc = 0
+    result.update({"run_at": now(), "head": facts["head"], "reviewed": False})
+    rdir = os.path.join(state_dir(root), "reviews")
+    os.makedirs(rdir, exist_ok=True)
+    path = os.path.join(rdir, dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H%M%SZ") + ".json")
+    write_json(path, result)
+    if rc == 0:
+        write_json(os.path.join(root, ".clafra", "review-state.json"), {"last_commit": facts["head"], "at": now()})
+    print(os.path.relpath(path, root))
+    return rc
+
+
+def load_json_str(s):
+    try:
+        return json.loads(s)
+    except ValueError:
+        return None
+
+
+def cmd_ack(a):
+    root = repo_root()
+    paths = [a.file] if a.file else unreviewed(root)
+    for p in paths:
+        data = load_json(p, {})
+        data["reviewed"] = True
+        data["reviewed_at"] = now()
+        write_json(p, data)
+        print("acknowledged", os.path.relpath(p, root))
+    return 0
+
+
+# ---------------------------------------------------------------- hooks
+# Hook output MUST be JSON hookSpecificOutput.additionalContext: plain stdout from a
+# PreToolUse hook never reaches the model (verified 2026-09-29; the old summon.sh bug).
+
+def emit(event, text):
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}))
+
+
+def hook_session_start(root, _event):
+    if not any(True for _ in skills(root)):
+        return 0
+    res = validate(root, write=True)
+    lines = []
+    for r in res:
+        if r["status"] == "stale":
+            lines.append(f"- skill '{r['skill']}' is STALE: " + "; ".join(r["reasons"]))
+        elif r["note"]:
+            lines.append(f"- skill '{r['skill']}': {r['note']}")
+    for p in unreviewed(root):
+        lines.append(f"- unreviewed maintenance review: {os.path.relpath(p, root)}")
+    if lines:
+        emit("SessionStart", "clafra governance (session start):\n" + "\n".join(lines)
+             + "\nSurface these to the user when relevant; do not fix silently.")
+    return 0
+
+
+def hook_pre_edit(root, event):
+    path = (event.get("tool_input") or {}).get("file_path") or ""
+    if not path:
+        return 0
+    rel = os.path.relpath(os.path.abspath(path), root)
+    hits = []
+    for name, _, meta in skills(root):
+        if any(fnmatch.fnmatch(rel, w) for w in meta.get("watches", [])):
+            hits.append((name, meta))
+    if not hits:
+        return 0
+    lines = [f"clafra constraints for {rel}:"]
+    for name, meta in hits:
+        lines.append(f"clafra[{name}]: {meta.get('intent', '')}")
+        for c in meta.get("checks", []):
+            lines.append(f"  must still hold: {c}")
+    append(root, "summon.log", f"{now()} | {rel} | {','.join(n for n, _ in hits)}")
+    emit("PreToolUse", "\n".join(lines))
+    return 0
+
+
+def cmd_hook(a):
+    try:
+        event = json.load(sys.stdin)
+    except ValueError:
+        event = {}
+    cwd = event.get("cwd")
+    root = os.environ.get("CLAUDE_PROJECT_DIR") or (cwd and git(cwd, "rev-parse", "--show-toplevel")) or cwd or repo_root()
+    try:
+        return {"session-start": hook_session_start, "pre-edit": hook_pre_edit}[a.event](root, event)
+    except Exception as e:  # a governance hook must never break the session
+        print(f"clafra hook error: {e}", file=sys.stderr)
+        return 0
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    p = argparse.ArgumentParser(prog="clafra", description=__doc__.split("\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("validate", help="run checks, update status, log")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--no-write", action="store_true")
+    s.set_defaults(fn=cmd_validate)
+
+    sub.add_parser("status", help="read-only summary").set_defaults(fn=cmd_status)
+
+    s = sub.add_parser("overlap", help="score an intent against existing skills")
+    s.add_argument("intent")
+    s.set_defaults(fn=cmd_overlap)
+
+    s = sub.add_parser("create", help="create a governed skill (enforces creation rules)")
+    s.add_argument("--name", required=True)
+    s.add_argument("--intent", required=True)
+    s.add_argument("--description")
+    s.add_argument("--body", help="SKILL.md body (markdown)")
+    s.add_argument("--watch", action="append", default=[])
+    s.add_argument("--check", action="append", default=[])
+    s.add_argument("--stack-dep", action="append", default=[])
+    s.add_argument("--evidence", action="append", default=[])
+    s.add_argument("--staleness-days", type=int, default=30)
+    s.add_argument("--confirm-distinct")
+    s.add_argument("--override-threshold")
+    s.set_defaults(fn=cmd_create)
+
+    s = sub.add_parser("deprecate", help="archive a stale skill with an audit trail")
+    s.add_argument("name")
+    s.add_argument("--reason", required=True)
+    s.add_argument("--force", action="store_true")
+    s.set_defaults(fn=cmd_deprecate)
+
+    sub.add_parser("gather", help="print mechanical facts (no LLM)").set_defaults(fn=cmd_gather)
+
+    s = sub.add_parser("review", help="LLM review of gathered facts via claude -p --json-schema")
+    s.add_argument("--model")
+    s.set_defaults(fn=cmd_review)
+
+    s = sub.add_parser("ack", help="mark review results as reviewed")
+    s.add_argument("file", nargs="?")
+    s.set_defaults(fn=cmd_ack)
+
+    s = sub.add_parser("hook", help="Claude Code hook entrypoint (reads event JSON on stdin)")
+    s.add_argument("event", choices=["session-start", "pre-edit"])
+    s.set_defaults(fn=cmd_hook)
+
+    a = p.parse_args()
+    sys.exit(a.fn(a))
+
+
+if __name__ == "__main__":
+    main()
