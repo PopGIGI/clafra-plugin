@@ -62,7 +62,7 @@ def git(root, *args):
         return None
 
 
-GITIGNORE = "# runtime state; audit.log and deprecated/ are the audit trail and stay tracked\nstate.json\nreview-state.json\nvalidation.log\nsummon.log\nreviews/\n"
+GITIGNORE = "# runtime state; audit.log and deprecated/ are the audit trail and stay tracked\nstate.json\nreview-state.json\nchecks.log\nsummon.log\nreviews/\n"
 
 
 def state_dir(root):
@@ -192,7 +192,7 @@ def validate(root, write=True):
                 rt.pop("stale_since", None)
             elif prev != "stale":
                 rt["stale_since"] = now()
-            append(root, "validation.log",
+            append(root, "checks.log",
                    f"{now()} | {head} | {name} | {'PASS' if not reasons else 'FAIL'} | {'; '.join(reasons) or 'ok'}")
     if write:
         state["skills"] = {k: v for k, v in runtime.items() if os.path.isdir(os.path.join(root, ".claude", "skills", k))}
