@@ -47,13 +47,26 @@ repo, then runs six scenarios. Every assertion can fail — the live ones check 
 model *actually received* (it must quote the injected text), with negative controls.
 Results go to `demo/last-run.jsonl`.
 
-## Try / install
+## Install
 
 ```bash
-claude --plugin-dir /home/pop/clafra-plugin     # one session
+ln -s /home/pop/clafra-plugin ~/.claude/skills/clafra   # auto-loads everywhere as clafra@skills-dir
+claude --plugin-dir /home/pop/clafra-plugin              # or: one session only
 ```
 
 Hooks are no-ops in repos without governed skills.
+
+## Scheduled review
+
+`bin/clafra-cron` runs `clafra review` for each repo in `~/.config/clafra/repos`
+(one path per line), sourcing `~/.claude/clafra-env` for headless auth. Repos are
+isolated from each other. When nothing is actionable, no LLM call is made and no file is
+written; findings land in `.clafra/reviews/` and surface at the next session start
+until `clafra ack`.
+
+```
+17 3 * * * /home/pop/clafra-plugin/bin/clafra-cron >> /home/pop/.local/state/clafra/cron.log 2>&1
+```
 
 ## Carried over vs dropped
 
@@ -70,8 +83,5 @@ Hooks are no-ops in repos without governed skills.
 
 ## Not done yet
 
-- Cron wiring for `clafra review` (the old cron at 03:17 still runs `/home/pop/clafra`).
-- Persistent install (e.g. `~/.claude/skills/clafra` symlink → auto-loads as `clafra@skills-dir`) — untested.
 - `claude plugin eval` suite — needs a newer CLI than the installed 2.1.195.
-- Migrating poracle-full's 7 tools (their grep checks cannot fail; they need rewriting, not porting).
 - Pattern mining that yields real candidates (evidence refs are manual today).

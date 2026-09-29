@@ -387,6 +387,12 @@ def cmd_gather(a):
 def cmd_review(a):
     root = repo_root()
     facts = gather(root)
+    if not fact_atoms(facts) and not a.force:
+        # Nothing actionable: no LLM call and no artifact (a daily "all clean" file is noise
+        # that buries real findings — the legacy cron piled up 50 of them unread).
+        write_json(os.path.join(state_dir(root), "review-state.json"), {"last_commit": facts["head"], "at": now()})
+        print("clean: no failures, renames or deletions since last review")
+        return 0
     schema = load_json(os.path.join(PLUGIN_ROOT, "schemas", "review.schema.json"))
     prompt = (
         "You are the clafra maintenance reviewer. Below is a FACTS artifact produced mechanically "
@@ -554,6 +560,7 @@ def main():
 
     s = sub.add_parser("review", help="LLM review of gathered facts via claude -p --json-schema")
     s.add_argument("--model")
+    s.add_argument("--force", action="store_true", help="call the LLM even when nothing is actionable")
     s.set_defaults(fn=cmd_review)
 
     s = sub.add_parser("ack", help="mark review results as reviewed")
