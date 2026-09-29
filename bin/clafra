@@ -351,10 +351,24 @@ def gather(root):
     state = load_json(os.path.join(root, ".clafra", "review-state.json"), {}) or {}
     head = git(root, "rev-parse", "HEAD")
     base = state.get("last_commit")
+    governed = list(skills(root))
+
+    def relevant(path):
+        # Only moves/deletions a governed skill depends on are facts; unrelated
+        # housekeeping must not trigger an LLM call.
+        for _, _, meta in governed:
+            if any(fnmatch.fnmatch(path, w) for w in meta.get("watches", [])):
+                return True
+            if any(path in c for c in meta.get("checks", [])):
+                return True
+        return False
+
     renames, deleted = [], []
     if base and head and base != head:
         for line in (git(root, "diff", "-M", "--name-status", base, head) or "").splitlines():
             parts = line.split("\t")
+            if len(parts) < 2 or not relevant(parts[1]):
+                continue
             if parts[0].startswith("R") and len(parts) == 3:
                 renames.append({"old_path": parts[1], "new_path": parts[2],
                                 "fact": f"renamed {parts[1]} -> {parts[2]}"})
