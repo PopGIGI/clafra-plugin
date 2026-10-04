@@ -80,24 +80,22 @@ jq -n --arg c "$(git rev-parse HEAD)" '{last_commit:$c}' > .clafra/review-state.
 echo "work dir: $WORK   live: $LIVE   model: $MODEL"
 
 # ------------------------------------------------------------------ 1. context
-bold "1. Edit-time context — Claude receives a skill's constraints when editing a watched file"
+bold "1. Read-time context — a skill's constraints load as soon as Claude reads a watched file"
 S=context
-hook_out="$(jq -cn --arg p "$REPO/src/fees.py" --arg c "$REPO" '{tool_name:"Edit",tool_input:{file_path:$p},cwd:$c}' | "$CLAFRA" hook pre-edit)"
-check $S "hook emits additionalContext JSON for watched src/fees.py" "$hook_out" \
-    bash -c 'jq -e ".hookSpecificOutput.additionalContext | test(\"clafra\\\\[fee-calc\\\\]\")" <<<"$0"' "$hook_out"
-hook_out="$(jq -cn --arg p "$REPO/src/report.py" --arg c "$REPO" '{tool_name:"Edit",tool_input:{file_path:$p},cwd:$c}' | "$CLAFRA" hook pre-edit)"
-check $S "hook stays silent for unwatched src/report.py" "output='$hook_out'" test -z "$hook_out"
+RULE=.claude/rules/clafra-fee-calc.md
+check $S "validate generated a path-scoped rule for fee-calc" "$(cat "$RULE" 2>/dev/null)" \
+    bash -c 'grep -qx "  - \"src/fees.py\"" "$0" && grep -q "clafra\[fee-calc\]" "$0"' "$RULE"
+check $S "generated rules are gitignored" "$(git check-ignore -v "$RULE")" git check-ignore -q "$RULE"
+check $S "no rule for an unwatched file" "$(ls .claude/rules)" bash -c '! grep -l "src/report.py" .claude/rules/clafra-*.md'
 
 if [[ $LIVE -eq 1 ]]; then
-    Q='After your edit, quote verbatim every line beginning with "clafra[" that appeared in any hook context you received. If there were none, answer exactly NO-CLAFRA-CONTEXT.'
-    out="$(ask "In src/fees.py change DEFAULT_RATE to Decimal(\"0.03\") using the Edit tool. $Q")"
-    check $S "live: model quotes clafra[fee-calc] after editing src/fees.py" "$out" grep -q 'clafra\[fee-calc\]' <<<"$out"
-    check $S "live: plugin hook actually fired (summon.log)" "$(cat .clafra/summon.log 2>/dev/null)" grep -q 'src/fees.py | fee-calc' .clafra/summon.log
-    out="$(ask "In src/report.py change the banner to use '--' instead of '=='. Use the Edit tool. $Q")"
-    check $S "live control: no clafra context for unwatched src/report.py" "$out" grep -q 'NO-CLAFRA-CONTEXT' <<<"$out"
-    git checkout -q -- src/
+    Q='Do not edit anything. Then quote verbatim every line beginning with "clafra[" present in your context from any source. If there are none, answer exactly NO-CLAFRA-CONTEXT.'
+    out="$(ask "Use the Read tool on src/fees.py. $Q")"
+    check $S "live: just READING src/fees.py brings in clafra[fee-calc]" "$out" grep -q 'clafra\[fee-calc\]' <<<"$out"
+    out="$(ask "Use the Read tool on src/report.py. $Q")"
+    check $S "live control: reading unwatched src/report.py brings in nothing" "$out" grep -q 'NO-CLAFRA-CONTEXT' <<<"$out"
 else
-    record $S "live: model receives context" SKIP "offline"
+    record $S "live: model receives context on read" SKIP "offline"
 fi
 
 # ------------------------------------------------------------------ 2. drift
@@ -110,6 +108,7 @@ git -c user.name=demo -c user.email=demo@local commit -qam "rename fees -> billi
 expect_rc $S "validate exits 1 after the refactor" 1 "$CLAFRA" validate
 check $S "fee-calc flagged: watched path missing: src/fees.py" "$LAST_OUT" grep -q 'watched path missing: src/fees.py' <<<"$LAST_OUT"
 check $S "legacy-export flagged stale" "$LAST_OUT" grep -q 'legacy-export: stale' <<<"$LAST_OUT"
+check $S "fee-calc's read-time rule now says STALE" "$(grep STALE "$RULE")" grep -q 'STALE since' "$RULE"
 ss="$(jq -cn --arg c "$REPO" '{hook_event_name:"SessionStart",cwd:$c}' | "$CLAFRA" hook session-start)"
 check $S "SessionStart hook emits STALE notice as additionalContext" "$ss" \
     bash -c 'jq -e ".hookSpecificOutput.additionalContext | test(\"fee-calc.*STALE\")" <<<"$0"' "$ss"
@@ -159,7 +158,7 @@ jq '.watches = ["src/billing.py"] | .checks |= map(gsub("src/fees.py"; "src/bill
 "$CLAFRA" validate > "$WORK/v.txt"
 check $S "fee-calc is active again after the fix" "$(cat "$WORK/v.txt")" grep -q '✓ fee-calc: active' "$WORK/v.txt"
 check $S "validation leaves tracked files clean except the intended fix" "$(git status --porcelain)" \
-    bash -c '[[ "$(git status --porcelain -- . ":!.clafra" ":!.claude/skills/fee-calc/clafra.json")" == "" ]]'
+    bash -c '[[ "$(git status --porcelain -- . ":!.clafra" ":!.claude/rules" ":!.claude/skills/fee-calc/clafra.json")" == "" ]]'
 git -c user.name=demo -c user.email=demo@local commit -qam "fee-calc: follow rename" && git add .clafra && git -c user.name=demo -c user.email=demo@local commit -qm "clafra audit trail" >/dev/null
 
 # ------------------------------------------------------------------ 4b. incremental validation
@@ -179,6 +178,45 @@ git checkout -q -- src/
 check $S "reverting restores active (re-checked, not cached)" "$(cat "$WORK/v.txt")" grep -qx '✓ fee-calc: active' "$WORK/v.txt"
 "$CLAFRA" validate --full > "$WORK/v.txt"
 check $S "--full re-runs every check" "$(cat "$WORK/v.txt")" bash -c '! grep -q cached "$0"' "$WORK/v.txt"
+
+# ------------------------------------------------------------------ 4c. end-of-turn check
+bold "4c. End-of-turn check — breaking a governed file sends Claude back before it can finish"
+S=stop
+SID=demo-offline
+ev() { jq -cn --arg c "$REPO" --arg s "$SID" --argjson a "$1" '{hook_event_name:"Stop",cwd:$c,session_id:$s,stop_hook_active:$a}'; }
+jq -cn --arg c "$REPO" --arg s "$SID" '{hook_event_name:"SessionStart",cwd:$c,session_id:$s}' | "$CLAFRA" hook session-start >/dev/null
+out="$(ev false | "$CLAFRA" hook stop)"
+check $S "nothing changed: stop is silent" "out='$out'" test -z "$out"
+echo "# note" >> src/report.py
+out="$(ev false | "$CLAFRA" hook stop)"
+check $S "unrelated file changed: stop is silent" "out='$out'" test -z "$out"
+sed -i 's/Decimal("0.025")/Decimal("0.03")/' src/billing.py      # via sed: no Edit tool involved
+out="$(ev false | "$CLAFRA" hook stop)"
+check $S "watched file broken via sed: stop blocks, naming fee-calc" "$out" \
+    bash -c 'jq -e "(.decision == \"block\") and (.reason | test(\"fee-calc\"))" <<<"$0"' "$out"
+out="$(ev true | "$CLAFRA" hook stop)"
+check $S "second stop in the same turn: warning only (no loop)" "$out" \
+    bash -c 'jq -e "(has(\"decision\") | not) and (.systemMessage | test(\"fee-calc\"))" <<<"$0"' "$out"
+out="$(ev false | "$CLAFRA" hook stop)"
+check $S "same unchanged failure on a later turn is not re-blocked" "$out" \
+    bash -c 'jq -e "has(\"decision\") | not" <<<"$0"' "$out"
+check $S "read-time rule marks fee-calc STALE mid-session" "$(grep STALE "$RULE")" grep -q 'STALE since' "$RULE"
+git checkout -q -- src/
+out="$(ev false | "$CLAFRA" hook stop)"
+check $S "after revert: stop is silent" "out='$out'" test -z "$out"
+check $S "after revert: rule no longer STALE" "$(grep -c STALE "$RULE")" bash -c '! grep -q STALE "$0"' "$RULE"
+
+if [[ $LIVE -eq 1 ]]; then
+    : > .clafra/stop.log
+    out="$(ask 'In src/billing.py change DEFAULT_RATE to Decimal("0.03") using the Edit tool.')"
+    check $S "live: the end-of-turn hook blocked the breaking edit" "$(cat .clafra/stop.log)" grep -q 'block | fee-calc' .clafra/stop.log
+    check $S "live: Claude resolved it (checks pass again, or it reports the rule change)" "$out" \
+        bash -c '"$1" validate --full >/dev/null || grep -qi "fee-calc" <<<"$0"' "$out" "$CLAFRA"
+    git checkout -q -- src/ .claude/skills/
+    "$CLAFRA" validate >/dev/null
+else
+    record $S "live: end-of-turn block" SKIP "offline"
+fi
 
 # ------------------------------------------------------------------ 5. creation guard
 bold "5. Creation guard — overlap, evidence threshold and verifiable checks are enforced"
@@ -217,6 +255,8 @@ dep="$(ls -d .clafra/deprecated/legacy-export-* 2>/dev/null | head -1)"
 check $S "archived with deprecation.json (reason + stale reasons)" "$(cat "$dep/deprecation.json" 2>/dev/null)" \
     jq -e '.reason and (.stale_reasons | length > 0)' "$dep/deprecation.json"
 check $S "no longer discoverable in .claude/skills/" "$(ls .claude/skills)" test ! -e .claude/skills/legacy-export
+check $S "its read-time rule is removed; the new skill's rule exists" "$(ls .claude/rules)" \
+    bash -c 'test ! -e .claude/rules/clafra-legacy-export.md && test -e .claude/rules/clafra-order-totals.md'
 expect_rc $S "repo validates clean afterwards (exit 0)" 0 "$CLAFRA" validate
 
 # ------------------------------------------------------------------ summary

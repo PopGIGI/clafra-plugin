@@ -26,7 +26,8 @@ gitignored, so validation never dirties the repo. `.clafra/audit.log` and
 
 | Mechanism | How | Proven by demo scenario |
 |---|---|---|
-| Edit-time context | `PreToolUse(Edit\|Write)` hook → `additionalContext` with the intent + checks of every skill watching that file | 1 |
+| Read-time context | each skill compiles to a generated, gitignored `.claude/rules/clafra-<skill>.md` scoped to its `watches`; Claude Code loads it natively when Claude **reads** (or edits) a matching file, i.e. while planning. Stale skills' rules say STALE | 1 |
+| End-of-turn check | `SessionStart` records a baseline (HEAD + hash of dirty files); the `Stop` hook re-runs checks of skills whose files changed this session — by any means, including Bash — and sends Claude back once to fix the code or update the skill | 4c |
 | Drift at session start | `SessionStart` hook runs `clafra validate` (incremental: a skill's checks re-run only when its watched / check-referenced / stack / skill files changed; `--full` forces all); stale skills are injected as context | 2, 4b |
 | Deprecation proposal | a skill stale longer than its `staleness_days` (default 30) is flagged "propose deprecation" | 6 |
 | Maintenance review | `clafra gather` (pure code) → `claude -p --json-schema` → findings must cite an **exact** fact atom or are dropped | 3 |
@@ -39,8 +40,8 @@ Plugin skills: `/clafra:status`, `/clafra:create`, `/clafra:review`, `/clafra:de
 ## Demo
 
 ```bash
-demo/demo.sh --offline   # 29 mechanical assertions, no model calls
-demo/demo.sh             # + 8 live assertions via claude -p (haiku), isolated HOME
+demo/demo.sh --offline   # 40 mechanical assertions, no model calls
+demo/demo.sh             # + 9 live assertions via claude -p (haiku), isolated HOME
 ```
 
 Copies `demo/fixture/` (a tiny fee calculator with two governed skills) to a temp
@@ -74,7 +75,7 @@ until `clafra ack`.
 | From | Kept as | Dropped (why) |
 |---|---|---|
 | clafra `tools/*.json` | `SKILL.md` + `clafra.json` | JSON-only tools Claude never loaded |
-| clafra `summon.sh` | `hook pre-edit` | plain stdout — never reached the model |
+| clafra `summon.sh` | generated path-scoped rules (read time) | plain stdout never reached the model; edit time was after planning |
 | clafra `validate.sh --session-start` | `SessionStart` hook | "remember to run it" instruction in CLAUDE.md |
 | clafra `cron-gather` / `cron-dispatch` | `gather` / `review` | hand-parsed LLM JSON → `--json-schema`; substring citing → exact atoms |
 | clafra `create-tool.sh`, similarity-local | `create`, `overlap` | SSH remote similarity tier (never configured) |
