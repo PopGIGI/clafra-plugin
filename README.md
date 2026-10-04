@@ -27,7 +27,8 @@ gitignored, so validation never dirties the repo. `.clafra/audit.log` and
 | Mechanism | How | Proven by demo scenario |
 |---|---|---|
 | Edit-time context | `PreToolUse(Edit\|Write)` hook → `additionalContext` with the intent + checks of every skill watching that file | 1 |
-| Drift at session start | `SessionStart` hook runs `clafra validate`; stale skills are injected as context | 2 |
+| Drift at session start | `SessionStart` hook runs `clafra validate` (incremental: a skill's checks re-run only when its watched / check-referenced / stack / skill files changed; `--full` forces all); stale skills are injected as context | 2, 4b |
+| Deprecation proposal | a skill stale longer than its `staleness_days` (default 30) is flagged "propose deprecation" | 6 |
 | Maintenance review | `clafra gather` (pure code) → `claude -p --json-schema` → findings must cite an **exact** fact atom or are dropped | 3 |
 | Creation guard | `clafra create`: overlap ≥0.7 blocked, 0.4–0.7 needs a human decision, <3 evidence refs blocked, checks must pass at birth | 5 |
 | Deprecation | `clafra deprecate`: stale only (unless `--force`), moved to `.clafra/deprecated/` with `deprecation.json` | 6 |
@@ -38,8 +39,8 @@ Plugin skills: `/clafra:status`, `/clafra:create`, `/clafra:review`, `/clafra:de
 ## Demo
 
 ```bash
-demo/demo.sh --offline   # 22 mechanical assertions, no model calls
-demo/demo.sh             # + 8 live assertions via claude -p (haiku, ~$0.10), isolated HOME
+demo/demo.sh --offline   # 29 mechanical assertions, no model calls
+demo/demo.sh             # + 8 live assertions via claude -p (haiku), isolated HOME
 ```
 
 Copies `demo/fixture/` (a tiny fee calculator with two governed skills) to a temp

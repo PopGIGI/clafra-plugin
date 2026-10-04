@@ -162,6 +162,24 @@ check $S "validation leaves tracked files clean except the intended fix" "$(git 
     bash -c '[[ "$(git status --porcelain -- . ":!.clafra" ":!.claude/skills/fee-calc/clafra.json")" == "" ]]'
 git -c user.name=demo -c user.email=demo@local commit -qam "fee-calc: follow rename" && git add .clafra && git -c user.name=demo -c user.email=demo@local commit -qm "clafra audit trail" >/dev/null
 
+# ------------------------------------------------------------------ 4b. incremental validation
+bold "4b. Incremental validation — checks re-run only when a skill's own files change"
+S=cache
+"$CLAFRA" validate >/dev/null   # settle after the commit above (clafra.json changed)
+"$CLAFRA" validate > "$WORK/v.txt"
+check $S "unchanged skill is served from cache" "$(cat "$WORK/v.txt")" grep -q '✓ fee-calc: active (cached)' "$WORK/v.txt"
+echo "# touched" >> src/report.py
+"$CLAFRA" validate > "$WORK/v.txt"
+check $S "editing an unrelated file keeps the cache" "$(cat "$WORK/v.txt")" grep -q '✓ fee-calc: active (cached)' "$WORK/v.txt"
+sed -i 's/rounding=ROUND_HALF_EVEN)/rounding=ROUND_HALF_UP)/' src/billing.py
+"$CLAFRA" validate > "$WORK/v.txt"
+check $S "uncommitted break in a watched file invalidates the cache (stale)" "$(cat "$WORK/v.txt")" grep -q '✗ fee-calc: stale' "$WORK/v.txt"
+git checkout -q -- src/
+"$CLAFRA" validate > "$WORK/v.txt"
+check $S "reverting restores active (re-checked, not cached)" "$(cat "$WORK/v.txt")" grep -qx '✓ fee-calc: active' "$WORK/v.txt"
+"$CLAFRA" validate --full > "$WORK/v.txt"
+check $S "--full re-runs every check" "$(cat "$WORK/v.txt")" bash -c '! grep -q cached "$0"' "$WORK/v.txt"
+
 # ------------------------------------------------------------------ 5. creation guard
 bold "5. Creation guard — overlap, evidence threshold and verifiable checks are enforced"
 S=create
@@ -186,6 +204,14 @@ check $S "audit.log records both blocks and the creation" "$(cat .clafra/audit.l
 bold "6. Deprecation — only stale skills are retired, with an audit trail"
 S=deprecate
 expect_rc $S "deprecating an active skill is refused (exit 2)" 2 "$CLAFRA" deprecate fee-calc --reason "demo"
+tmp="$(mktemp)"
+jq --arg t "$(date -u -d '40 days ago' +%Y-%m-%dT%H:%M:%SZ)" '.skills["legacy-export"].stale_since = $t' .clafra/state.json > "$tmp" && mv "$tmp" .clafra/state.json
+"$CLAFRA" validate > "$WORK/v.txt"
+check $S "skill stale past its staleness_days (30) is flagged for deprecation" "$(cat "$WORK/v.txt")" \
+    grep -q 'stale for 40 days (limit 30): propose deprecation' "$WORK/v.txt"
+ss="$(jq -cn --arg c "$REPO" '{hook_event_name:"SessionStart",cwd:$c}' | "$CLAFRA" hook session-start)"
+check $S "session-start notice carries the deprecation proposal" "$ss" \
+    bash -c 'jq -e ".hookSpecificOutput.additionalContext | test(\"legacy-export.*propose deprecation\")" <<<"$0"' "$ss"
 expect_rc $S "stale legacy-export is deprecated (exit 0)" 0 "$CLAFRA" deprecate legacy-export --reason "legacy CSV export removed in refactor"
 dep="$(ls -d .clafra/deprecated/legacy-export-* 2>/dev/null | head -1)"
 check $S "archived with deprecation.json (reason + stale reasons)" "$(cat "$dep/deprecation.json" 2>/dev/null)" \

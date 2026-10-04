@@ -10,7 +10,7 @@ with a sidecar clafra.json holding governance metadata:
     stack_dependencies   files whose change forces revalidation
     evidence             >=3 session refs justifying creation
     status               active | stale
-    last_validated / validated_commit / staleness_days
+    staleness_days       days a skill may stay stale before deprecation is proposed
 
 Subcommands: validate, status, create, overlap, deprecate, gather, review, ack,
 hook session-start, hook pre-edit. Stdlib only.
@@ -166,21 +166,55 @@ def evaluate(root, name, meta):
     return reasons
 
 
-def validate(root, write=True):
+def changed_since(root, commit):
+    """Paths changed from `commit` to the working tree (committed + uncommitted), or None if unknown."""
+    if not commit:
+        return None
+    # --no-renames: a rename must report the OLD path too, or a moved watched file looks untouched.
+    committed = git(root, "diff", "--name-only", "--no-renames", commit, "HEAD")
+    if committed is None:
+        return None
+    files = set(committed.splitlines())
+    for line in (git(root, "status", "--porcelain", "--untracked-files=all") or "").splitlines():
+        files.update(p.strip('"') for p in line[3:].split(" -> "))
+    return files
+
+
+def depends_on(name, meta, path):
+    if path.startswith(f".claude/skills/{name}/"):
+        return True
+    if any(fnmatch.fnmatch(path, p) for p in meta.get("watches", []) + meta.get("stack_dependencies", [])):
+        return True
+    return any(path in c for c in meta.get("checks", []))
+
+
+def days_since(ts):
+    then = dt.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+    return (dt.datetime.now(dt.timezone.utc) - then).days
+
+
+def validate(root, write=True, full=False):
+    """Run each skill's checks. Incremental unless `full`: an active skill whose watched,
+    check-referenced, stack or skill-dir files are unchanged since its last pass is reported
+    as cached without re-running checks (the nightly review always evaluates everything)."""
     head = git(root, "rev-parse", "--short", "HEAD") or "nogit"
     state = load_state(root)
     runtime = state.setdefault("skills", {})
     results = []
     for name, d, meta in skills(root):
+        if not full and meta.get("status") == "active":
+            changed = changed_since(root, meta.get("validated_commit"))
+            if changed is not None and not any(depends_on(name, meta, f) for f in changed):
+                results.append({"skill": name, "status": "active", "reasons": [], "note": None, "cached": True})
+                continue
         reasons = evaluate(root, name, meta)
         status = "stale" if reasons else "active"
-        age_note = None
-        if not reasons and meta.get("last_validated"):
-            last = dt.datetime.strptime(meta["last_validated"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
-            age = (dt.datetime.now(dt.timezone.utc) - last).days
-            if age > meta.get("staleness_days", 30):
-                age_note = f"not validated for {age} days"
-        results.append({"skill": name, "status": status, "reasons": reasons, "note": age_note})
+        note = None
+        if reasons and meta.get("status") == "stale" and meta.get("stale_since"):
+            days = days_since(meta["stale_since"])
+            if days >= meta.get("staleness_days", 30):
+                note = f"stale for {days} days (limit {meta.get('staleness_days', 30)}): propose deprecation"
+        results.append({"skill": name, "status": status, "reasons": reasons, "note": note, "cached": False})
         if write:
             rt = runtime.setdefault(name, {})
             prev = rt.get("status")
@@ -209,7 +243,7 @@ def unreviewed(root):
 
 def cmd_validate(a):
     root = repo_root()
-    res = validate(root, write=not a.no_write)
+    res = validate(root, write=not a.no_write, full=a.full)
     if a.json:
         print(json.dumps(res, indent=2))
     else:
@@ -217,7 +251,7 @@ def cmd_validate(a):
             print("clafra: no governed skills in", root)
         for r in res:
             mark = "✓" if r["status"] == "active" else "✗"
-            print(f"{mark} {r['skill']}: {r['status']}")
+            print(f"{mark} {r['skill']}: {r['status']}" + (" (cached)" if r.get("cached") else ""))
             for why in r["reasons"]:
                 print(f"    - {why}")
             if r["note"]:
@@ -227,7 +261,7 @@ def cmd_validate(a):
 
 def cmd_status(a):
     root = repo_root()
-    rc = cmd_validate(argparse.Namespace(json=False, no_write=True))
+    rc = cmd_validate(argparse.Namespace(json=False, no_write=True, full=False))
     for p in unreviewed(root):
         print(f"! unreviewed maintenance review: {os.path.relpath(p, root)}")
     dep = sorted(glob.glob(os.path.join(root, ".clafra", "deprecated", "*")))
@@ -487,9 +521,8 @@ def hook_session_start(root, _event):
     lines = []
     for r in res:
         if r["status"] == "stale":
-            lines.append(f"- skill '{r['skill']}' is STALE: " + "; ".join(r["reasons"]))
-        elif r["note"]:
-            lines.append(f"- skill '{r['skill']}': {r['note']}")
+            lines.append(f"- skill '{r['skill']}' is STALE: " + "; ".join(r["reasons"])
+                         + (f" [{r['note']}]" if r["note"] else ""))
     for p in unreviewed(root):
         lines.append(f"- unreviewed maintenance review: {os.path.relpath(p, root)}")
     if lines:
@@ -542,6 +575,7 @@ def main():
     s = sub.add_parser("validate", help="run checks, update status, log")
     s.add_argument("--json", action="store_true")
     s.add_argument("--no-write", action="store_true")
+    s.add_argument("--full", action="store_true", help="re-run every check, ignoring the change cache")
     s.set_defaults(fn=cmd_validate)
 
     sub.add_parser("status", help="read-only summary").set_defaults(fn=cmd_status)
