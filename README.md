@@ -31,16 +31,38 @@ gitignored, so validation never dirties the repo. `.clafra/audit.log` and
 | Drift at session start | `SessionStart` hook runs `clafra validate` (incremental: a skill's checks re-run only when its watched / check-referenced / stack / skill files changed; `--full` forces all); stale skills are injected as context | 2, 4b |
 | Deprecation proposal | a skill stale longer than its `staleness_days` (default 30) is flagged "propose deprecation" | 6 |
 | Maintenance review (on demand) | `clafra gather` (pure code) → `claude -p --json-schema` → findings must cite an **exact** fact atom or are dropped | 3 |
+| Trust | check commands run only after a human approves them with `clafra trust` in an interactive terminal; approvals (a fingerprint of each skill's checks) live outside the repo in `~/.config/clafra/trust.json`, so a cloned repo can't trust itself and any change to a check (a pull, an agent loosening it) makes the skill UNTRUSTED until re-approved | 7 |
 | Creation guard | `clafra create`: overlap ≥0.7 blocked, 0.4–0.7 needs a human decision, <3 evidence refs blocked, checks must pass at birth | 5 |
 | Deprecation | `clafra deprecate`: stale only (unless `--force`), moved to `.clafra/deprecated/` with `deprecation.json` | 6 |
 
 Plugin skills: `/clafra:status`, `/clafra:create`, `/clafra:review`, `/clafra:deprecate`
 (user-invoked only). `bin/clafra` is on the Bash PATH while the plugin is loaded.
 
+## Trust model
+
+Checks are shell commands that hooks and the nightly cron run automatically, so:
+
+- In a repo you haven't approved, nothing runs; the session-start notice asks **you** to run
+  `clafra trust` (it lists every command first). New skills and changed checks are pending
+  until approved; their status is `untrusted` (never green) and their rules say UNTRUSTED.
+- If the agent changes a skill's checks during a session, the end-of-turn hook sends it back to
+  tell you; it cannot make a weakened check pass silently.
+- Text injected into context is built only from repo-authored fields (intent, check strings,
+  paths), stripped of control characters and length-capped; command output is never injected.
+
+Limits, honestly: `clafra trust` refuses without a TTY, but an agent with an unrestricted shell
+can fake one (`script`) or write the trust file. Close the obvious paths with user-level
+deny rules in `~/.claude/settings.json`, e.g.:
+
+```json
+"permissions": { "deny": ["Bash(clafra trust:*)", "Bash(script:*)",
+                          "Edit(~/.config/clafra/**)", "Write(~/.config/clafra/**)"] }
+```
+
 ## Demo
 
 ```bash
-demo/demo.sh --offline   # 40 mechanical assertions, no model calls
+demo/demo.sh --offline   # 51 mechanical assertions, no model calls
 demo/demo.sh             # + 9 live assertions via claude -p (haiku), isolated HOME
 ```
 

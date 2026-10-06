@@ -12,7 +12,7 @@ with a sidecar clafra.json holding governance metadata:
     status               active | stale
     staleness_days       days a skill may stay stale before deprecation is proposed
 
-Subcommands: validate, status, create, overlap, deprecate, gather, review, ack,
+Subcommands: validate, status, create, overlap, deprecate, trust, gather, review, ack,
 hook session-start, hook stop. Stdlib only.
 """
 import argparse
@@ -144,6 +144,41 @@ def is_glob(p):
     return any(c in p for c in "*?[")
 
 
+# ---------------------------------------------------------------- trust
+# Checks are shell commands that hooks and cron run automatically, so they only run once a
+# human has approved them. Approvals live OUTSIDE the repo (a cloned repo cannot trust
+# itself) as a fingerprint of each skill's checks; any change to the checks (a pull, or an
+# agent loosening one) makes the skill untrusted until re-approved with `clafra trust`,
+# which requires an interactive terminal. This is a speed bump against an agent with an
+# unrestricted shell, not a sandbox: pair it with permission deny rules (see README).
+
+def trust_file():
+    return os.environ.get("CLAFRA_TRUST_FILE") or os.path.expanduser("~/.config/clafra/trust.json")
+
+
+def checks_fp(meta):
+    return hashlib.sha256(json.dumps(meta.get("checks", [])).encode()).hexdigest()[:16]
+
+
+def untrusted_reason(root, name, meta):
+    """None when this skill's current checks are approved, else why not."""
+    repo = ((load_json(trust_file(), {}) or {}).get("repos") or {}).get(os.path.realpath(root))
+    if repo is None:
+        return "repo not trusted: checks not run (the user must run `clafra trust` in their own terminal)"
+    fp = (repo.get("skills") or {}).get(name)
+    if fp is None:
+        return "new skill: checks not yet approved (the user must run `clafra trust` in their own terminal)"
+    if fp != checks_fp(meta):
+        return "checks changed since approval: not run until the user re-approves with `clafra trust`"
+    return None
+
+
+def clean(text, limit=4000):
+    """Strip control characters and cap length before text enters Claude's context."""
+    text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", str(text))
+    return text if len(text) <= limit else text[:limit] + " …[truncated]"
+
+
 # ---------------------------------------------------------------- validation
 
 def evaluate(root, name, meta):
@@ -212,6 +247,12 @@ def validate(root, write=True, full=False):
     runtime = state.setdefault("skills", {})
     results = []
     for name, d, meta in skills(root):
+        why = untrusted_reason(root, name, meta)
+        if why:
+            results.append({"skill": name, "status": "untrusted", "reasons": [why], "note": None, "cached": False})
+            if write:
+                runtime.setdefault(name, {}).update({"status": "untrusted", "stale_reasons": [why]})
+            continue
         if not full and meta.get("status") == "active":
             changed = changed_since(root, meta.get("validated_commit"))
             if changed is not None and not any(depends_on(name, meta, f) for f in changed):
@@ -266,9 +307,11 @@ def rule_text(name, meta):
     if meta.get("status") == "stale":
         lines += ["", f"**STALE since {meta.get('stale_since', '?')}: do not rely on this skill until it is fixed.** "
                   + "; ".join(meta.get("stale_reasons", []))]
+    elif meta.get("status") == "untrusted":
+        lines += ["", "**UNTRUSTED: " + "; ".join(meta.get("stale_reasons", [])) + "**"]
     lines += ["", "Must still hold (re-checked before you finish if you change these files):"]
     lines += [f"- `{c}`" if "`" not in c else f"- {c}" for c in meta.get("checks", [])]
-    return "\n".join(lines) + "\n"
+    return "\n".join(clean(l, 1000) for l in lines) + "\n"
 
 
 def sync_rules(root):
@@ -304,7 +347,7 @@ def cmd_validate(a):
         if not res:
             print("clafra: no governed skills in", root)
         for r in res:
-            mark = "✓" if r["status"] == "active" else "✗"
+            mark = {"active": "✓", "untrusted": "?"}.get(r["status"], "✗")
             print(f"{mark} {r['skill']}: {r['status']}" + (" (cached)" if r.get("cached") else ""))
             for why in r["reasons"]:
                 print(f"    - {why}")
@@ -404,6 +447,8 @@ def cmd_create(a):
     append(root, "audit.log", f"{now()} | created | {a.name} | evidence={len(a.evidence)}"
            + (f" override={a.override_threshold!r}" if a.override_threshold else ""))
     print(f"created .claude/skills/{a.name}/ (SKILL.md + clafra.json)")
+    if untrusted_reason(root, a.name, meta):
+        print("its checks will run automatically only after the user approves them: `clafra trust` in their own terminal")
     return 0
 
 
@@ -469,7 +514,9 @@ def gather(root):
     for name, _, meta in skills(root):
         facts["skills"].append({
             "skill": name, "intent": meta.get("intent"), "watches": meta.get("watches", []),
-            "checks": meta.get("checks", []), "failures": evaluate(root, name, meta),
+            "checks": meta.get("checks", []),
+            "failures": [] if untrusted_reason(root, name, meta) else evaluate(root, name, meta),
+            "untrusted": untrusted_reason(root, name, meta),
             "stale_since": meta.get("stale_since"),
         })
     return facts
@@ -550,6 +597,51 @@ def load_json_str(s):
         return None
 
 
+def cmd_trust(a):
+    root = repo_root()
+    key = os.path.realpath(root)
+    data = load_json(trust_file(), {}) or {}
+    repos = data.setdefault("repos", {})
+    if a.revoke:
+        repos.pop(key, None)
+        os.makedirs(os.path.dirname(trust_file()), exist_ok=True)
+        write_json(trust_file(), data)
+        append(root, "audit.log", f"{now()} | trust-revoked | {key}")
+        print("revoked trust for", key)
+        return 0
+    entries = list(skills(root))
+    approved = (repos.get(key) or {}).get("skills") or {}
+    pending = [(n, m) for n, _, m in entries if approved.get(n) != checks_fp(m)]
+    print(f"repo: {key}")
+    for n, _, m in entries:
+        print(f"  {'pending ' if (n, m) in pending else 'approved'}  {n}")
+    if not pending:
+        print("nothing to approve")
+        return 0
+    print("\nThese commands will run automatically (session start, end of turn, nightly cron):")
+    for n, m in pending:
+        print(f"\n  [{n}] {'changed' if n in approved else 'new'}")
+        for c in m.get("checks", []):
+            print(f"    $ {c}")
+    if a.list:
+        return 0
+    if not sys.stdin.isatty():
+        print("\nREFUSED: approval needs an interactive terminal. Run `clafra trust` yourself, not through an agent.",
+              file=sys.stderr)
+        return 3
+    if input(f"\nTrust these commands for {key}? Type 'yes': ").strip() != "yes":
+        print("not trusted")
+        return 1
+    repos[key] = {"skills": {n: checks_fp(m) for n, _, m in entries}, "approved_at": now()}
+    os.makedirs(os.path.dirname(trust_file()), exist_ok=True)
+    write_json(trust_file(), data)
+    os.chmod(trust_file(), 0o600)
+    append(root, "audit.log", f"{now()} | trusted | {', '.join(n for n, _ in pending)}")
+    validate(root, write=True)
+    print("trusted.")
+    return 0
+
+
 def cmd_ack(a):
     root = repo_root()
     paths = [a.file] if a.file else unreviewed(root)
@@ -567,7 +659,7 @@ def cmd_ack(a):
 # PreToolUse hook never reaches the model (verified 2026-09-29; the old summon.sh bug).
 
 def emit(event, text):
-    print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}))
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": clean(text)}}))
 
 
 def hook_session_start(root, event):
@@ -576,6 +668,12 @@ def hook_session_start(root, event):
     snapshot(root, event.get("session_id") or "unknown")
     res = validate(root, write=True)
     lines = []
+    untrusted = [r for r in res if r["status"] == "untrusted"]
+    if untrusted and all(r["reasons"][0].startswith("repo not trusted") for r in untrusted):
+        lines.append(f"- repo not trusted: checks of {len(untrusted)} governed skill(s) are not run. Ask the user to "
+                     "review and approve them by running `clafra trust` in their own terminal (never run it yourself).")
+    else:
+        lines += [f"- skill '{r['skill']}' UNTRUSTED: {r['reasons'][0]}" for r in untrusted]
     for r in res:
         if r["status"] == "stale":
             lines.append(f"- skill '{r['skill']}' is STALE: " + "; ".join(r["reasons"])
@@ -670,12 +768,23 @@ def hook_stop(root, event):
         rel = sorted((p, dirty.get(p, "committed")) for p in changed if depends_on(name, meta, p))
         fp = hashlib.sha1(json.dumps([head, rel]).encode()).hexdigest()
         prev = snap["checked"].get(name)
-        if prev and prev["fp"] == fp:
+        why = untrusted_reason(root, name, meta)
+        if why:
+            # Never execute. If this session edited the skill's own checks, the user must hear about it.
+            if any(p.startswith(f".claude/skills/{name}/") for p in changed) and why.startswith("checks changed"):
+                reasons = [why + ". You changed this skill's checks in this session: tell the user explicitly "
+                           "what changed and why; only they can approve it, in their own terminal"]
+            else:
+                reasons = []
+            fp = hashlib.sha1(json.dumps([fp, why]).encode()).hexdigest()
+        elif prev and prev["fp"] == fp:
             reasons = prev["reasons"]
         else:
             reasons = evaluate(root, name, meta)
             record(root, runtime, name, reasons, (head or "nogit")[:7], source="stop")
             prev = None
+        if why:
+            runtime.setdefault(name, {}).update({"status": "untrusted", "stale_reasons": [why]})
         if reasons:
             failures[name] = reasons
             if not (prev and prev.get("blocked")):
@@ -690,11 +799,11 @@ def hook_stop(root, event):
     detail = "\n".join(f"- {n}: " + "; ".join(r) for n, r in failures.items())
     if new_failure and not event.get("stop_hook_active"):
         append(root, "stop.log", f"{now()} | block | {','.join(failures)}")
-        print(json.dumps({"decision": "block", "reason": (
+        print(json.dumps({"decision": "block", "reason": clean(
             "clafra: files you changed in this session are governed by skills whose checks now fail:\n"
             + detail + "\nBefore finishing, either fix the code so the checks pass, or, if the change is "
             "intentional, update that skill (.claude/skills/<name>/SKILL.md and clafra.json checks) in this "
-            "same change and tell the user explicitly which rule changed.")}))
+            "same change and tell the user explicitly which rule changed. Never run `clafra trust` yourself.")}))
         return 0
     append(root, "stop.log", f"{now()} | warn | {','.join(failures)}")
     print(json.dumps({"systemMessage": "clafra: checks still failing for " + ", ".join(failures)
@@ -763,6 +872,11 @@ def main():
     s.add_argument("--model")
     s.add_argument("--force", action="store_true", help="call the LLM even when nothing is actionable")
     s.set_defaults(fn=cmd_review)
+
+    s = sub.add_parser("trust", help="approve this repo's check commands (interactive terminal only)")
+    s.add_argument("--list", action="store_true", help="show what would be approved, change nothing")
+    s.add_argument("--revoke", action="store_true", help="remove this repo's approvals")
+    s.set_defaults(fn=cmd_trust)
 
     s = sub.add_parser("ack", help="mark review results as reviewed")
     s.add_argument("file", nargs="?")

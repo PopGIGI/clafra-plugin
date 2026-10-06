@@ -75,7 +75,11 @@ cp -r "$PLUGIN/demo/fixture" "$REPO"
 cd "$REPO" || exit 1
 git init -q && git add -A && git -c user.name=demo -c user.email=demo@local commit -qm "fixture"
 export CLAFRA_ROOT="$REPO"
-"$CLAFRA" validate >/dev/null
+export CLAFRA_TRUST_FILE="$WORK/trust.json"     # never touch the real ~/.config/clafra/trust.json
+# Stand-in for the human typing 'yes' at `clafra trust` in their own terminal. `script`
+# fakes a TTY, which is exactly why the README pairs trust with permission deny rules.
+approve() { ( cd "${1:-$REPO}" && CLAFRA_ROOT="${1:-$REPO}" script -qec "$CLAFRA trust" /dev/null <<<"yes" >/dev/null ); }
+approve
 jq -n --arg c "$(git rev-parse HEAD)" '{last_commit:$c}' > .clafra/review-state.json
 echo "work dir: $WORK   live: $LIVE   model: $MODEL"
 
@@ -156,6 +160,9 @@ tmp="$(mktemp)"
 jq '.watches = ["src/billing.py"] | .checks |= map(gsub("src/fees.py"; "src/billing.py") | gsub("from fees import"; "from billing import"))' \
     .claude/skills/fee-calc/clafra.json > "$tmp" && mv "$tmp" .claude/skills/fee-calc/clafra.json
 "$CLAFRA" validate > "$WORK/v.txt"
+check $S "a repaired (changed) check is untrusted until approved" "$(cat "$WORK/v.txt")" grep -q '? fee-calc: untrusted' "$WORK/v.txt"
+approve   # the human reviews and approves the repaired check
+"$CLAFRA" validate > "$WORK/v.txt"
 check $S "fee-calc is active again after the fix" "$(cat "$WORK/v.txt")" grep -q '✓ fee-calc: active' "$WORK/v.txt"
 check $S "validation leaves tracked files clean except the intended fix" "$(git status --porcelain)" \
     bash -c '[[ "$(git status --porcelain -- . ":!.clafra" ":!.claude/rules" ":!.claude/skills/fee-calc/clafra.json")" == "" ]]'
@@ -233,6 +240,9 @@ expect_rc $S "skill whose check fails at birth is blocked (exit 5)" 5 "$CLAFRA" 
 expect_rc $S "distinct, evidenced, verifiable skill is created (exit 0)" 0 "$CLAFRA" create --name order-totals \
     --intent "Sum order line items into a total before fees" --watch src/orders.py \
     --check "grep -q 'def order_total' src/orders.py" --evidence x --evidence y --evidence z
+"$CLAFRA" validate > "$WORK/v.txt"
+check $S "a newly created skill's checks don't run until approved" "$(cat "$WORK/v.txt")" grep -q '? order-totals: untrusted' "$WORK/v.txt"
+approve
 check $S "created as a native skill (SKILL.md frontmatter name)" "$(head -3 .claude/skills/order-totals/SKILL.md 2>/dev/null)" \
     grep -q '^name: order-totals$' .claude/skills/order-totals/SKILL.md
 check $S "audit.log records both blocks and the creation" "$(cat .clafra/audit.log)" \
@@ -258,6 +268,40 @@ check $S "no longer discoverable in .claude/skills/" "$(ls .claude/skills)" test
 check $S "its read-time rule is removed; the new skill's rule exists" "$(ls .claude/rules)" \
     bash -c 'test ! -e .claude/rules/clafra-legacy-export.md && test -e .claude/rules/clafra-order-totals.md'
 expect_rc $S "repo validates clean afterwards (exit 0)" 0 "$CLAFRA" validate
+
+# ------------------------------------------------------------------ 7. trust
+bold "7. Trust — check commands run only after a human approves them in a terminal"
+S=trust
+U="$WORK/cloned"; CANARY="$WORK/canary"
+cp -r "$PLUGIN/demo/fixture" "$U"
+jq --arg c "touch $CANARY" '.checks += [$c]' "$U/.claude/skills/fee-calc/clafra.json" > "$WORK/t.json" \
+    && mv "$WORK/t.json" "$U/.claude/skills/fee-calc/clafra.json"
+( cd "$U" && git init -q && git add -A && git -c user.name=x -c user.email=x@x commit -qm "someone else's repo" )
+ss="$(jq -cn --arg c "$U" '{hook_event_name:"SessionStart",cwd:$c,session_id:"cloned"}' | CLAFRA_ROOT="$U" "$CLAFRA" hook session-start)"
+( cd "$U" && CLAFRA_ROOT="$U" "$CLAFRA" validate --full >/dev/null )
+check $S "cloned repo: its check commands never ran (canary absent)" "$(ls "$WORK")" test ! -e "$CANARY"
+check $S "session start asks the user to approve, not the agent" "$ss" \
+    bash -c 'jq -e ".hookSpecificOutput.additionalContext | test(\"repo not trusted.*never run it yourself\")" <<<"$0"' "$ss"
+expect_rc $S "clafra trust refuses without an interactive terminal (exit 3)" 3 \
+    bash -c 'cd "$1" && echo yes | CLAFRA_ROOT="$1" "$2" trust' _ "$U" "$CLAFRA"
+check $S "canary still absent after the refused approval" "$(ls "$WORK")" test ! -e "$CANARY"
+approve "$U"
+check $S "after a human approves, the checks do run (canary present)" "$(ls "$WORK")" test -e "$CANARY"
+
+SID=demo-trust
+jq -cn --arg c "$REPO" --arg s "$SID" '{hook_event_name:"SessionStart",cwd:$c,session_id:$s}' | "$CLAFRA" hook session-start >/dev/null
+jq '.checks = ["true"]' .claude/skills/fee-calc/clafra.json > "$WORK/t.json" && mv "$WORK/t.json" .claude/skills/fee-calc/clafra.json
+"$CLAFRA" validate > "$WORK/v.txt"
+check $S "agent loosens fee-calc's check to 'true': skill becomes untrusted, not green" "$(cat "$WORK/v.txt")" \
+    grep -q '? fee-calc: untrusted' "$WORK/v.txt"
+check $S "its read-time rule says UNTRUSTED" "$(grep UNTRUSTED "$RULE")" grep -q 'UNTRUSTED: checks changed' "$RULE"
+out="$(jq -cn --arg c "$REPO" --arg s "$SID" '{hook_event_name:"Stop",cwd:$c,session_id:$s,stop_hook_active:false}' | "$CLAFRA" hook stop)"
+check $S "end of turn: agent is sent back to tell the user (only they can approve)" "$out" \
+    bash -c 'jq -e "(.decision == \"block\") and (.reason | test(\"only they can approve\"))" <<<"$0"' "$out"
+git checkout -q -- .claude/skills/
+"$CLAFRA" validate > "$WORK/v.txt"
+check $S "restoring the approved check makes fee-calc trusted and active again" "$(cat "$WORK/v.txt")" \
+    grep -q '✓ fee-calc: active' "$WORK/v.txt"
 
 # ------------------------------------------------------------------ summary
 bold "Result: $PASS passed, $FAIL failed, $SKIP skipped"
