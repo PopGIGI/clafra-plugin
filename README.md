@@ -30,7 +30,7 @@ gitignored, so validation never dirties the repo. `.clafra/audit.log` and
 | End-of-turn check | `SessionStart` records a baseline (HEAD + hash of dirty files); the `Stop` hook re-runs checks of skills whose files changed this session — by any means, including Bash — and sends Claude back once to fix the code or update the skill | 4c |
 | Drift at session start | `SessionStart` hook runs `clafra validate` (incremental: a skill's checks re-run only when its watched / check-referenced / stack / skill files changed; `--full` forces all); stale skills are injected as context | 2, 4b |
 | Deprecation proposal | a skill stale longer than its `staleness_days` (default 30) is flagged "propose deprecation" | 6 |
-| Maintenance review | `clafra gather` (pure code) → `claude -p --json-schema` → findings must cite an **exact** fact atom or are dropped | 3 |
+| Maintenance review (on demand) | `clafra gather` (pure code) → `claude -p --json-schema` → findings must cite an **exact** fact atom or are dropped | 3 |
 | Creation guard | `clafra create`: overlap ≥0.7 blocked, 0.4–0.7 needs a human decision, <3 evidence refs blocked, checks must pass at birth | 5 |
 | Deprecation | `clafra deprecate`: stale only (unless `--force`), moved to `.clafra/deprecated/` with `deprecation.json` | 6 |
 
@@ -60,15 +60,18 @@ Hooks are no-ops in repos without governed skills.
 
 ## Scheduled review
 
-`bin/clafra-cron` runs `clafra review` for each repo in `~/.config/clafra/repos`
-(one path per line), sourcing `~/.claude/clafra-env` for headless auth. Repos are
-isolated from each other. When nothing is actionable, no LLM call is made and no file is
-written; findings land in `.clafra/reviews/` and surface at the next session start
-until `clafra ack`.
+`bin/clafra-cron` runs `clafra validate --full` (every check, no cache, **no LLM**) for each
+repo in `~/.config/clafra/repos` (one path per line). Results land in each repo's
+`.clafra/state.json`, so stale skills surface at the next session start and in the
+read-time rules. Repos are isolated from each other.
 
 ```
 17 3 * * * /home/pop/clafra-plugin/bin/clafra-cron >> /home/pop/.local/state/clafra/cron.log 2>&1
 ```
+
+`clafra review` (LLM proposals over gathered facts, must cite exact facts) remains available
+on demand but is no longer scheduled: incremental validation + the end-of-turn check catch
+drift as it happens, and the scheduled LLM pass never produced a useful finding.
 
 ## Carried over vs dropped
 

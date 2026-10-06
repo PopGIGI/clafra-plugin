@@ -1,27 +1,22 @@
 #!/usr/bin/env bash
-# clafra-cron — scheduled maintenance review for every repo in the repos file.
+# clafra-cron — nightly full validation for every repo in the repos file.
 #
 # Crontab:  17 3 * * * /home/pop/clafra-plugin/bin/clafra-cron >> ~/.local/state/clafra/cron.log 2>&1
 #
 # Repos file (one absolute path per line, # comments ok): $CLAFRA_REPOS
 #   default ~/.config/clafra/repos
-# Headless auth: sources $CLAFRA_ENV_FILE (default ~/.claude/clafra-env) for
-# CLAUDE_CODE_OAUTH_TOKEN — cron has no desktop-app auth.
-# Each repo runs independently; one failure never skips the others.
+# Runs `clafra validate --full` (every check, no cache, no LLM). Results land in each
+# repo's .clafra/state.json, so stale skills surface at the next session start and in
+# the read-time rules. Each repo runs independently; one failure never skips the others.
 
 set -uo pipefail
 
 BIN="$(cd "$(dirname "$0")" && pwd)"
-ENV_FILE="${CLAFRA_ENV_FILE:-$HOME/.claude/clafra-env}"
 REPOS="${CLAFRA_REPOS:-$HOME/.config/clafra/repos}"
-MODEL="${CLAFRA_REVIEW_MODEL:-claude-sonnet-5-5}"
 export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
 
 log() { printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 
-if [[ -f "$ENV_FILE" ]]; then
-    set -a; . "$ENV_FILE"; set +a
-fi
 [[ -f "$REPOS" ]] || { log "no repos file at $REPOS"; exit 1; }
 
 fail=0
@@ -31,9 +26,10 @@ while IFS= read -r repo; do
     if [[ ! -d "$repo" ]]; then
         log "SKIP $repo: not a directory"; fail=1; continue
     fi
-    out="$(cd "$repo" && CLAFRA_ROOT="$repo" "$BIN/clafra" review --model "$MODEL" 2>&1)"
+    out="$(cd "$repo" && CLAFRA_ROOT="$repo" "$BIN/clafra" validate --full 2>&1)"
     rc=$?
-    log "$([[ $rc -eq 0 ]] && echo OK || echo FAIL) $repo: ${out//$'\n'/ | }"
-    [[ $rc -eq 0 ]] || fail=1
+    stale="$(grep -c '^✗' <<<"$out")"
+    log "$([[ $rc -eq 0 ]] && echo OK || echo STALE) $repo: $(grep -c '^[✓✗]' <<<"$out") skills, $stale stale${stale:+$( [[ $stale -gt 0 ]] && printf ' (%s)' "$(grep '^✗' <<<"$out" | cut -d' ' -f2 | tr -d ':' | paste -sd, -)")}"
+    [[ $rc -le 1 ]] || fail=1
 done < "$REPOS"
 exit $fail
