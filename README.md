@@ -32,11 +32,18 @@ gitignored, so validation never dirties the repo. `.clafra/audit.log` and
 | Deprecation proposal | a skill stale longer than its `staleness_days` (default 30) is flagged "propose deprecation" | 6 |
 | Maintenance review (on demand) | `clafra gather` (pure code) → `claude -p --json-schema` → findings must cite an **exact** fact atom or are dropped | 3 |
 | Trust | check commands run only after a human approves them with `clafra trust` in an interactive terminal; approvals (a fingerprint of each skill's checks) live outside the repo in `~/.config/clafra/trust.json`, so a cloned repo can't trust itself and any change to a check (a pull, an agent loosening it) makes the skill UNTRUSTED until re-approved | 7 |
+| Generated blocks | docs hold `<!-- clafra:begin NAME -->…<!-- clafra:end NAME -->`; NAME is a generator declared in the skill's `clafra.json` (`"generate": {NAME: cmd}`, fingerprinted by trust, so a doc can never introduce a command). `clafra sync` rewrites only between markers and verifies every byte outside is unchanged; an out-of-date or hand-edited block fails validation | 8 |
 | Creation guard | `clafra create`: overlap ≥0.7 blocked, 0.4–0.7 needs a human decision, <3 evidence refs blocked, checks must pass at birth | 5 |
 | Deprecation | `clafra deprecate`: stale only (unless `--force`), moved to `.clafra/deprecated/` with `deprecation.json` | 6 |
 
 Plugin skills: `/clafra:status`, `/clafra:create`, `/clafra:review`, `/clafra:deprecate`
 (user-invoked only). `bin/clafra` is on the Bash PATH while the plugin is loaded.
+
+## Deterministic doc edits
+
+clafra never edits prose with a model. Facts derivable from code go in generated blocks
+(`clafra sync`, deterministic, scoped to markers); prose that states a fact is written by a
+human (or a reviewed session) and guarded by a check; pure prose is left alone.
 
 ## Trust model
 
@@ -62,7 +69,7 @@ deny rules in `~/.claude/settings.json`, e.g.:
 ## Demo
 
 ```bash
-demo/demo.sh --offline   # 51 mechanical assertions, no model calls
+demo/demo.sh --offline   # 64 mechanical assertions, no model calls
 demo/demo.sh             # + 9 live assertions via claude -p (haiku), isolated HOME
 ```
 

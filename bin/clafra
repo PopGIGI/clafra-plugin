@@ -12,7 +12,7 @@ with a sidecar clafra.json holding governance metadata:
     status               active | stale
     staleness_days       days a skill may stay stale before deprecation is proposed
 
-Subcommands: validate, status, create, overlap, deprecate, trust, gather, review, ack,
+Subcommands: validate, status, create, overlap, deprecate, trust, sync, gather, review, ack,
 hook session-start, hook stop. Stdlib only.
 """
 import argparse
@@ -144,6 +144,146 @@ def is_glob(p):
     return any(c in p for c in "*?[")
 
 
+# ---------------------------------------------------------------- generated blocks
+# Deterministic doc content. A watched file may contain
+#     <!-- clafra:begin NAME -->  ...  <!-- clafra:end NAME -->
+# where NAME is a generator declared in the skill's clafra.json ("generate": {NAME: cmd}).
+# The command lives in clafra.json (fingerprinted by `clafra trust`), never in the doc, so a
+# doc edit cannot introduce a command. `clafra sync` replaces only the text between markers
+# and verifies that every byte outside them is unchanged; a stale block fails validation.
+
+BLOCK_RE = re.compile(r"<!-- clafra:(begin|end) ([A-Za-z0-9_.-]+) -->")
+
+
+def find_blocks(text):
+    """[(name, inner_start, inner_end)] or raise ValueError on malformed markers."""
+    blocks, open_ = [], None
+    for m in BLOCK_RE.finditer(text):
+        kind, name = m.groups()
+        if kind == "begin":
+            if open_:
+                raise ValueError(f"nested block '{name}' inside '{open_[0]}'")
+            open_ = (name, m.end())
+        else:
+            if not open_ or open_[0] != name:
+                raise ValueError(f"unmatched end marker '{name}'")
+            blocks.append((open_[0], open_[1], m.start()))
+            open_ = None
+    if open_:
+        raise ValueError(f"unclosed block '{open_[0]}'")
+    names = [b[0] for b in blocks]
+    if len(names) != len(set(names)):
+        raise ValueError("duplicate block names")
+    return blocks
+
+
+def outside(text, blocks):
+    """The text with every block's inner content removed: what sync must never change."""
+    out, pos = [], 0
+    for _, a, b in blocks:
+        out.append(text[pos:a])
+        pos = b
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def run_generator(root, cmd):
+    r = subprocess.run(cmd, shell=True, cwd=root, capture_output=True, text=True, timeout=CHECK_TIMEOUT,
+                       env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    if r.returncode != 0:
+        raise RuntimeError(f"generator exited {r.returncode}")
+    if BLOCK_RE.search(r.stdout):
+        raise RuntimeError("generator output contains clafra markers")
+    return "\n" + r.stdout.rstrip("\n") + "\n"
+
+
+def watched_files(root, meta):
+    files = set()
+    for w in meta.get("watches", []):
+        for p in glob.glob(os.path.join(root, w), recursive=True):
+            if os.path.isfile(p):
+                files.add(os.path.relpath(p, root))
+    return sorted(files)
+
+
+def plan_sync(root, meta):
+    """[(path, old_text, new_text, [problems])] for watched files containing blocks."""
+    gens = meta.get("generate") or {}
+    plans = []
+    for path in watched_files(root, meta):
+        try:
+            text = open(os.path.join(root, path), encoding="utf-8").read()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if "clafra:begin" not in text:
+            continue
+        problems = []
+        try:
+            blocks = find_blocks(text)
+        except ValueError as e:
+            plans.append((path, text, text, [f"malformed markers: {e}"]))
+            continue
+        new, pos = [], 0
+        for name, a, b in blocks:
+            new.append(text[pos:a])
+            inner = text[a:b]
+            if name not in gens:
+                problems.append((name, "names no generator declared in clafra.json"))
+            else:
+                try:
+                    inner = run_generator(root, gens[name])
+                except (RuntimeError, subprocess.TimeoutExpired) as e:
+                    problems.append((name, f"generator failed: {e}"))
+            new.append(inner)
+            pos = b
+        new.append(text[pos:])
+        new_text = "".join(new)
+        if outside(new_text, find_blocks(new_text)) != outside(text, blocks):
+            problems.append(("*", "sync would change text outside the markers (refused)"))
+        plans.append((path, text, new_text, problems))
+    return plans
+
+
+def generated_drift(root, meta):
+    if not meta.get("generate"):
+        return []
+    drift = []
+    for path, old, new, problems in plan_sync(root, meta):
+        drift += [(path, n, why) for n, why in problems]
+        if not problems and old != new:
+            drift.append((path, "*", "is out of date (run `clafra sync`)"))
+    return drift
+
+
+def cmd_sync(a):
+    root = repo_root()
+    rc = 0
+    for name, _, meta in skills(root):
+        if not meta.get("generate"):
+            continue
+        why = untrusted_reason(root, name, meta)
+        if why:
+            print(f"? {name}: {why}")
+            rc = max(rc, 2)
+            continue
+        for path, old, new, problems in plan_sync(root, meta):
+            for n, p in problems:
+                print(f"✗ {path} [{n}]: {p}")
+                rc = 2
+            if problems or old == new:
+                if not problems:
+                    print(f"✓ {path}: up to date")
+                continue
+            if a.check:
+                print(f"✗ {path}: out of date")
+                rc = max(rc, 1)
+                continue
+            with open(os.path.join(root, path), "w", encoding="utf-8") as f:
+                f.write(new)
+            print(f"↻ {path}: regenerated (only between markers)")
+    return rc
+
+
 # ---------------------------------------------------------------- trust
 # Checks are shell commands that hooks and cron run automatically, so they only run once a
 # human has approved them. Approvals live OUTSIDE the repo (a cloned repo cannot trust
@@ -157,7 +297,9 @@ def trust_file():
 
 
 def checks_fp(meta):
-    return hashlib.sha256(json.dumps(meta.get("checks", [])).encode()).hexdigest()[:16]
+    """Fingerprint of every command clafra may execute for this skill (checks + generators)."""
+    payload = meta.get("checks", []) if not meta.get("generate") else [meta.get("checks", []), meta["generate"]]
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
 
 
 def untrusted_reason(root, name, meta):
@@ -198,6 +340,8 @@ def evaluate(root, name, meta):
                 reasons.append(f"check failed: {c}")
         except subprocess.TimeoutExpired:
             reasons.append(f"check timed out: {c}")
+    for path, gid, err in generated_drift(root, meta):
+        reasons.append(f"generated block '{gid}' in {path} {err}")
     base = meta.get("validated_commit")
     deps = meta.get("stack_dependencies", [])
     if base and deps:
@@ -230,7 +374,7 @@ def depends_on(name, meta, path):
         return True
     if any(fnmatch.fnmatch(path, p) for p in meta.get("watches", []) + meta.get("stack_dependencies", [])):
         return True
-    return any(path in c for c in meta.get("checks", []))
+    return any(path in c for c in meta.get("checks", []) + list((meta.get("generate") or {}).values()))
 
 
 def days_since(ts):
@@ -623,6 +767,8 @@ def cmd_trust(a):
         print(f"\n  [{n}] {'changed' if n in approved else 'new'}")
         for c in m.get("checks", []):
             print(f"    $ {c}")
+        for g, c in (m.get("generate") or {}).items():
+            print(f"    $ {c}    (generator '{g}')")
     if a.list:
         return 0
     if not sys.stdin.isatty():
@@ -877,6 +1023,10 @@ def main():
     s.add_argument("--list", action="store_true", help="show what would be approved, change nothing")
     s.add_argument("--revoke", action="store_true", help="remove this repo's approvals")
     s.set_defaults(fn=cmd_trust)
+
+    s = sub.add_parser("sync", help="regenerate marked doc blocks from their generators (deterministic)")
+    s.add_argument("--check", action="store_true", help="report out-of-date blocks, write nothing")
+    s.set_defaults(fn=cmd_sync)
 
     s = sub.add_parser("ack", help="mark review results as reviewed")
     s.add_argument("file", nargs="?")

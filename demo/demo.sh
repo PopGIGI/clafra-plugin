@@ -303,6 +303,59 @@ git checkout -q -- .claude/skills/
 check $S "restoring the approved check makes fee-calc trusted and active again" "$(cat "$WORK/v.txt")" \
     grep -q '✓ fee-calc: active' "$WORK/v.txt"
 
+# ------------------------------------------------------------------ 8. generated blocks
+bold "8. Generated blocks — doc text derived from code, rewritten only between markers"
+S=sync
+G="$WORK/gen"; CANARY2="$WORK/canary2"
+cp -r "$PLUGIN/demo/fixture" "$G"
+mkdir -p "$G/tools"
+cat > "$G/tools/fee_rate.py" <<'PY'
+import re
+rate = re.search(r'DEFAULT_RATE = Decimal\("([0-9.]+)"\)', open("src/fees.py").read()).group(1)
+print(f"Default fee rate: {float(rate) * 100:g}%")
+PY
+printf '# shopcalc\n\nHand-written intro.\n\n<!-- clafra:begin fee-rate -->\nDefault fee rate: (stale)\n<!-- clafra:end fee-rate -->\n\nHand-written footer.\n' > "$G/README.md"
+jq '.watches += ["README.md"] | .generate = {"fee-rate": "python3 tools/fee_rate.py"}' \
+    "$G/.claude/skills/fee-calc/clafra.json" > "$WORK/t.json" && mv "$WORK/t.json" "$G/.claude/skills/fee-calc/clafra.json"
+( cd "$G" && git init -q && git add -A && git -c user.name=x -c user.email=x@x commit -qm gen )
+approve "$G"
+gv() { ( cd "$G" && CLAFRA_ROOT="$G" "$CLAFRA" "$@" ); }
+gv validate > "$WORK/v.txt"
+check $S "out-of-date block fails validation" "$(cat "$WORK/v.txt")" grep -q "generated block '\*' in README.md is out of date" "$WORK/v.txt"
+expect_rc $S "sync --check reports it and writes nothing (exit 1)" 1 bash -c 'cd "$1" && CLAFRA_ROOT="$1" "$2" sync --check' _ "$G" "$CLAFRA"
+cp "$G/README.md" "$WORK/readme.before"
+expect_rc $S "sync regenerates the block (exit 0)" 0 bash -c 'cd "$1" && CLAFRA_ROOT="$1" "$2" sync' _ "$G" "$CLAFRA"
+check $S "block now derived from code: 'Default fee rate: 2.5%'" "$(cat "$G/README.md")" grep -qx 'Default fee rate: 2.5%' "$G/README.md"
+check $S "every byte outside the markers is unchanged" "$(diff "$WORK/readme.before" "$G/README.md")" \
+    bash -c 'diff <(sed "/clafra:begin/,/clafra:end/d" "$0") <(sed "/clafra:begin/,/clafra:end/d" "$1")' "$WORK/readme.before" "$G/README.md"
+gv validate > "$WORK/v.txt"
+check $S "validates active once in sync" "$(cat "$WORK/v.txt")" grep -q '✓ fee-calc: active' "$WORK/v.txt"
+sed -i 's/Decimal("0.025")/Decimal("0.03")/' "$G/src/fees.py"
+gv validate > "$WORK/v.txt"
+check $S "code changes, doc can't silently disagree: block flagged out of date" "$(cat "$WORK/v.txt")" grep -q "generated block .* out of date" "$WORK/v.txt"
+gv sync >/dev/null
+check $S "sync follows the code: 'Default fee rate: 3%'" "$(grep 'fee rate' "$G/README.md")" grep -qx 'Default fee rate: 3%' "$G/README.md"
+( cd "$G" && git checkout -q -- src/ README.md )
+gv sync >/dev/null; sed -i 's/^Default fee rate: 2.5%$/Default fee rate: 0% (hand-edited)/' "$G/README.md"
+gv validate > "$WORK/v.txt"
+check $S "hand-editing inside the block is caught" "$(cat "$WORK/v.txt")" grep -q "out of date" "$WORK/v.txt"
+gv sync >/dev/null
+printf '\n<!-- clafra:begin evil -->\nx\n<!-- clafra:end evil -->\n' >> "$G/README.md"; cp "$G/README.md" "$WORK/readme.evil"
+expect_rc $S "a marker naming an undeclared generator: sync refuses (exit 2)" 2 bash -c 'cd "$1" && CLAFRA_ROOT="$1" "$2" sync' _ "$G" "$CLAFRA"
+check $S "...and the doc is left untouched" "" cmp -s "$WORK/readme.evil" "$G/README.md"
+( cd "$G" && git checkout -q -- README.md ) && gv sync >/dev/null
+jq --arg c "touch $CANARY2; python3 tools/fee_rate.py" '.generate["fee-rate"] = $c' "$G/.claude/skills/fee-calc/clafra.json" > "$WORK/t.json" \
+    && mv "$WORK/t.json" "$G/.claude/skills/fee-calc/clafra.json"
+gv sync > "$WORK/v.txt"; gv validate >> "$WORK/v.txt"
+check $S "a changed generator command is untrusted: not run until approved" "$(cat "$WORK/v.txt")" \
+    bash -c 'grep -q "fee-calc: untrusted" "$0" && test ! -e "$1"' "$WORK/v.txt" "$CANARY2"
+jq '.generate["fee-rate"] = "echo \"<!-- clafra:end fee-rate -->injected\""' "$G/.claude/skills/fee-calc/clafra.json" > "$WORK/t.json" \
+    && mv "$WORK/t.json" "$G/.claude/skills/fee-calc/clafra.json"
+approve "$G"; cp "$G/README.md" "$WORK/readme.pre"
+gv sync > "$WORK/v.txt"
+check $S "generator output containing markers is refused, doc untouched" "$(cat "$WORK/v.txt")" \
+    bash -c 'grep -q "contains clafra markers" "$0" && cmp -s "$1" "$2"' "$WORK/v.txt" "$WORK/readme.pre" "$G/README.md"
+
 # ------------------------------------------------------------------ summary
 bold "Result: $PASS passed, $FAIL failed, $SKIP skipped"
 cp "$REPORT" "$PLUGIN/demo/last-run.jsonl"
