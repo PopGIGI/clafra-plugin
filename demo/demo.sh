@@ -270,7 +270,7 @@ bold "6. Deprecation — only stale skills are retired, with an audit trail"
 S=deprecate
 expect_rc $S "deprecating an active skill is refused (exit 2)" 2 "$CLAFRA" deprecate fee-calc --reason "demo"
 tmp="$(mktemp)"
-jq --arg t "$(date -u -d '40 days ago' +%Y-%m-%dT%H:%M:%SZ)" '.skills["legacy-export"].stale_since = $t' .clafra/state.json > "$tmp" && mv "$tmp" .clafra/state.json
+jq --arg t "$(python3 -c 'import datetime as d; print((d.datetime.now(d.timezone.utc) - d.timedelta(days=40)).strftime("%Y-%m-%dT%H:%M:%SZ"))')" '.skills["legacy-export"].stale_since = $t' .clafra/state.json > "$tmp" && mv "$tmp" .clafra/state.json
 "$CLAFRA" validate > "$WORK/v.txt"
 check $S "skill stale past its staleness_days (30) is flagged for deprecation" "$(cat "$WORK/v.txt")" \
     grep -q 'stale for 40 days (limit 30): propose deprecation' "$WORK/v.txt"
