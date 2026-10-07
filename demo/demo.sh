@@ -79,14 +79,23 @@ cd "$REPO" || exit 1
 git init -q && git add -A && git -c user.name=demo -c user.email=demo@local commit -qm "fixture"
 export CLAFRA_ROOT="$REPO"
 export CLAFRA_TRUST_FILE="$WORK/trust.json"     # never touch the real ~/.config/clafra/trust.json
-# Stand-in for the human typing 'yes' at `clafra trust` in their own terminal. `script`
-# fakes a TTY, which is exactly why the README pairs trust with permission deny rules.
-if script --version 2>/dev/null | grep -q util-linux; then
-    faketty() { script -qec "$*" /dev/null; }          # util-linux (Linux)
-else
-    faketty() { script -q /dev/null "$@"; }            # BSD (macOS)
-fi
-approve() { ( cd "${1:-$REPO}" && CLAFRA_ROOT="${1:-$REPO}" faketty "$CLAFRA" trust <<<"yes" >/dev/null ); }
+# Stand-in for the human typing 'yes' at `clafra trust` in their own terminal: a pseudo-
+# terminal fakes the TTY (as `script` would), which is exactly why the README pairs trust
+# with permission deny rules. Python's pty works the same on Linux and macOS.
+approve() {
+    ( cd "${1:-$REPO}" && CLAFRA_ROOT="${1:-$REPO}" python3 -c '
+import os, pty, sys
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(sys.argv[1], sys.argv[1:])
+os.write(fd, b"yes\n")
+while True:
+    try:
+        if not os.read(fd, 1024): break
+    except OSError: break
+sys.exit(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]) if hasattr(os, "waitstatus_to_exitcode") else 0)
+' "$CLAFRA" trust >/dev/null )
+}
 approve
 jq -n --arg c "$(git rev-parse HEAD)" '{last_commit:$c}' > .clafra/review-state.json
 echo "work dir: $WORK   live: $LIVE   model: $MODEL"
