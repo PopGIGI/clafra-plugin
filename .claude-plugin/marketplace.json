@@ -1,0 +1,19 @@
+{
+  "name": "clafra",
+  "owner": {
+    "name": "PopGIGI",
+    "url": "https://github.com/PopGIGI"
+  },
+  "metadata": {
+    "description": "clafra: skill lifecycle governance for Claude Code"
+  },
+  "plugins": [
+    {
+      "name": "clafra",
+      "source": "./",
+      "description": "Keeps Claude Code skills true: declared dependencies, checks that can fail, stale-skill alerts, governed creation and deprecation.",
+      "version": "0.2.0",
+      "license": "MIT"
+    }
+  ]
+}

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # clafra-cron — nightly full validation for every repo in the repos file.
 #
-# Crontab:  17 3 * * * /home/pop/clafra-plugin/bin/clafra-cron >> ~/.local/state/clafra/cron.log 2>&1
+# Crontab:  17 3 * * * /path/to/clafra/bin/clafra-cron >> ~/.local/state/clafra/cron.log 2>&1
 #
 # Repos file (one absolute path per line, # comments ok): $CLAFRA_REPOS
 #   default ~/.config/clafra/repos

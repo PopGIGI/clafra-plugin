@@ -54,6 +54,9 @@ expect_rc() { # scenario claim expected-rc command...
     LAST_OUT="$out"
 }
 
+# In-place sed that works with both GNU and BSD (macOS) sed.
+sedi() { local expr="$1" f="$2"; sed "$expr" "$f" > "$f.sedi" && cat "$f.sedi" > "$f" && rm -f "$f.sedi"; }
+
 # Live model call: fresh HOME, plugin loaded via --plugin-dir, cwd = fixture.
 ask() {
     ( cd "$REPO" && HOME="$WORK/home" timeout 240 claude -p "$1" --model "$MODEL" \
@@ -78,7 +81,12 @@ export CLAFRA_ROOT="$REPO"
 export CLAFRA_TRUST_FILE="$WORK/trust.json"     # never touch the real ~/.config/clafra/trust.json
 # Stand-in for the human typing 'yes' at `clafra trust` in their own terminal. `script`
 # fakes a TTY, which is exactly why the README pairs trust with permission deny rules.
-approve() { ( cd "${1:-$REPO}" && CLAFRA_ROOT="${1:-$REPO}" script -qec "$CLAFRA trust" /dev/null <<<"yes" >/dev/null ); }
+if script --version 2>/dev/null | grep -q util-linux; then
+    faketty() { script -qec "$*" /dev/null; }          # util-linux (Linux)
+else
+    faketty() { script -q /dev/null "$@"; }            # BSD (macOS)
+fi
+approve() { ( cd "${1:-$REPO}" && CLAFRA_ROOT="${1:-$REPO}" faketty "$CLAFRA" trust <<<"yes" >/dev/null ); }
 approve
 jq -n --arg c "$(git rev-parse HEAD)" '{last_commit:$c}' > .clafra/review-state.json
 echo "work dir: $WORK   live: $LIVE   model: $MODEL"
@@ -106,7 +114,7 @@ fi
 bold "2. Drift — renaming/deleting what a skill depends on makes it stale at next session start"
 S=drift
 git mv src/fees.py src/billing.py
-sed -i 's/^from fees import/from billing import/' src/orders.py
+sedi 's/^from fees import/from billing import/' src/orders.py
 git rm -q src/legacy_export.py
 git -c user.name=demo -c user.email=demo@local commit -qam "rename fees -> billing, drop legacy export"
 expect_rc $S "validate exits 1 after the refactor" 1 "$CLAFRA" validate
@@ -177,7 +185,7 @@ check $S "unchanged skill is served from cache" "$(cat "$WORK/v.txt")" grep -q '
 echo "# touched" >> src/report.py
 "$CLAFRA" validate > "$WORK/v.txt"
 check $S "editing an unrelated file keeps the cache" "$(cat "$WORK/v.txt")" grep -q '✓ fee-calc: active (cached)' "$WORK/v.txt"
-sed -i 's/rounding=ROUND_HALF_EVEN)/rounding=ROUND_HALF_UP)/' src/billing.py
+sedi 's/rounding=ROUND_HALF_EVEN)/rounding=ROUND_HALF_UP)/' src/billing.py
 "$CLAFRA" validate > "$WORK/v.txt"
 check $S "uncommitted break in a watched file invalidates the cache (stale)" "$(cat "$WORK/v.txt")" grep -q '✗ fee-calc: stale' "$WORK/v.txt"
 git checkout -q -- src/
@@ -197,7 +205,7 @@ check $S "nothing changed: stop is silent" "out='$out'" test -z "$out"
 echo "# note" >> src/report.py
 out="$(ev false | "$CLAFRA" hook stop)"
 check $S "unrelated file changed: stop is silent" "out='$out'" test -z "$out"
-sed -i 's/Decimal("0.025")/Decimal("0.03")/' src/billing.py      # via sed: no Edit tool involved
+sedi 's/Decimal("0.025")/Decimal("0.03")/' src/billing.py      # via sed: no Edit tool involved
 out="$(ev false | "$CLAFRA" hook stop)"
 check $S "watched file broken via sed: stop blocks, naming fee-calc" "$out" \
     bash -c 'jq -e "(.decision == \"block\") and (.reason | test(\"fee-calc\"))" <<<"$0"' "$out"
@@ -330,13 +338,13 @@ check $S "every byte outside the markers is unchanged" "$(diff "$WORK/readme.bef
     bash -c 'diff <(sed "/clafra:begin/,/clafra:end/d" "$0") <(sed "/clafra:begin/,/clafra:end/d" "$1")' "$WORK/readme.before" "$G/README.md"
 gv validate > "$WORK/v.txt"
 check $S "validates active once in sync" "$(cat "$WORK/v.txt")" grep -q '✓ fee-calc: active' "$WORK/v.txt"
-sed -i 's/Decimal("0.025")/Decimal("0.03")/' "$G/src/fees.py"
+sedi 's/Decimal("0.025")/Decimal("0.03")/' "$G/src/fees.py"
 gv validate > "$WORK/v.txt"
 check $S "code changes, doc can't silently disagree: block flagged out of date" "$(cat "$WORK/v.txt")" grep -q "generated block .* out of date" "$WORK/v.txt"
 gv sync >/dev/null
 check $S "sync follows the code: 'Default fee rate: 3%'" "$(grep 'fee rate' "$G/README.md")" grep -qx 'Default fee rate: 3%' "$G/README.md"
 ( cd "$G" && git checkout -q -- src/ README.md )
-gv sync >/dev/null; sed -i 's/^Default fee rate: 2.5%$/Default fee rate: 0% (hand-edited)/' "$G/README.md"
+gv sync >/dev/null; sedi 's/^Default fee rate: 2.5%$/Default fee rate: 0% (hand-edited)/' "$G/README.md"
 gv validate > "$WORK/v.txt"
 check $S "hand-editing inside the block is caught" "$(cat "$WORK/v.txt")" grep -q "out of date" "$WORK/v.txt"
 gv sync >/dev/null

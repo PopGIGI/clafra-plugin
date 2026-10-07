@@ -1,7 +1,11 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "clafra",
-  "version": "0.1.0",
-  "description": "Skill lifecycle governance: creation threshold + overlap guard, drift detection, edit-time constraints, deprecation with audit trail, artifact-grounded maintenance review.",
-  "author": { "name": "PoP" }
+  "version": "0.2.0",
+  "description": "Keeps Claude Code skills true: each skill declares the files it depends on and checks that prove it still holds; clafra re-runs them, flags stale skills to Claude, and gates creation and deprecation.",
+  "author": { "name": "PopGIGI", "url": "https://github.com/PopGIGI" },
+  "homepage": "https://github.com/PopGIGI/clafra-plugin",
+  "repository": "https://github.com/PopGIGI/clafra-plugin",
+  "license": "MIT",
+  "keywords": ["skills", "governance", "drift", "documentation", "hooks"]
 }
