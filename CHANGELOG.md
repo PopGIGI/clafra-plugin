@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **Fix:** change detection dropped the first character of the first `git status` path when
+  that file had unstaged changes (` M path`, whose leading space was stripped), so that file
+  was invisible to the end-of-turn check and to incremental validation. `git status` is now
+  read NUL-delimited (`-z`), which also handles quoted paths and both sides of a rename.
+- **Fix:** the end-of-turn hook logged `pass` for untrusted skills whose checks it never ran;
+  it now logs `skipped (untrusted)`.
+
 ## 0.2.0 — 2026-10-07
 
 First public release.

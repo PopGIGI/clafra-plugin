@@ -229,6 +229,19 @@ git checkout -q -- src/
 out="$(ev false | "$CLAFRA" hook stop)"
 check $S "after revert: stop is silent" "out='$out'" test -z "$out"
 check $S "after revert: rule no longer STALE" "$(grep -c STALE "$RULE")" bash -c '! grep -q STALE "$0"' "$RULE"
+# A watched file already dirty when the session starts, as the first `git status` line
+# (" M path"): its leading space must not be stripped along with the path's first char.
+echo "# wip" >> src/billing.py
+first="$(git status --porcelain | head -1)"
+check $S "precondition: the dirty watched file is the first, unstaged status line" "$first" test "$first" = " M src/billing.py"
+SID=demo-offline-dirty
+jq -cn --arg c "$REPO" --arg s "$SID" '{hook_event_name:"SessionStart",cwd:$c,session_id:$s}' | "$CLAFRA" hook session-start >/dev/null
+sedi 's/Decimal("0.025")/Decimal("0.03")/' src/billing.py
+out="$(ev false | "$CLAFRA" hook stop)"
+check $S "watched file dirty before the session, broken during it: stop blocks" "$out" \
+    bash -c 'jq -e "(.decision == \"block\") and (.reason | test(\"fee-calc\"))" <<<"$0"' "$out"
+git checkout -q -- src/
+"$CLAFRA" validate >/dev/null
 
 if [[ $LIVE -eq 1 ]]; then
     : > .clafra/stop.log
@@ -302,6 +315,13 @@ check $S "session start asks the user to approve, not the agent" "$ss" \
 expect_rc $S "clafra trust refuses without an interactive terminal (exit 3)" 3 \
     bash -c 'cd "$1" && echo yes | CLAFRA_ROOT="$1" "$2" trust' _ "$U" "$CLAFRA"
 check $S "canary still absent after the refused approval" "$(ls "$WORK")" test ! -e "$CANARY"
+echo "# edit" >> "$U/src/fees.py"
+( cd "$U" && jq -cn --arg c "$U" '{hook_event_name:"Stop",cwd:$c,session_id:"cloned",stop_hook_active:false}' \
+    | CLAFRA_ROOT="$U" "$CLAFRA" hook stop >/dev/null )
+check $S "end of turn on an untrusted repo logs the skip, never a 'pass'" "$(cat "$U/.clafra/stop.log" 2>&1)" \
+    bash -c 'grep -q "| skipped (untrusted) | fee-calc" "$0" && ! grep -q "| pass |" "$0"' "$U/.clafra/stop.log"
+check $S "...and still runs nothing (canary absent)" "$(ls "$WORK")" test ! -e "$CANARY"
+( cd "$U" && git checkout -q -- src/ )
 approve "$U"
 check $S "after a human approves, the checks do run (canary present)" "$(ls "$WORK")" test -e "$CANARY"
 
