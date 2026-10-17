@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.1 — 2026-10-17
 
 - **Fix:** change detection dropped the first character of the first `git status` path when
   that file had unstaged changes (` M path`, whose leading space was stripped), so that file

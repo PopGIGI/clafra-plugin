@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "clafra",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Keeps Claude Code skills true: each skill declares the files it depends on and checks that prove it still holds; clafra re-runs them, flags stale skills to Claude, and gates creation and deprecation.",
   "author": { "name": "PopGIGI", "url": "https://github.com/PopGIGI" },
   "homepage": "https://github.com/PopGIGI/clafra-plugin",
